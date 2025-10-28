@@ -211,10 +211,10 @@ if CPU_FALLBACK:
 # OpenAI-compatible Chat API models (VLM-enhanced)
 # -------------------------
 class ContentPart(BaseModel):
-    type: str = Field(..., description="Content type: 'text' or 'image'")
+    type: str = Field(..., description="Content type: 'text', 'image', or 'image_url'")
     text: Optional[str] = Field(None, description="Text content when type='text'")
-    image: Optional[str] = Field(None, description="Image URL or base64 when type='image'")
-    image_url: Optional[Dict[str, str]] = Field(None, description="OpenAI format: {'url': '...'}")
+    image: Optional[str] = Field(None, description="Image URL or base64 when type='image' (deprecated, use image_url)")
+    image_url: Optional[Dict[str, str]] = Field(None, description="OpenAI format: {'url': '...'} when type='image_url'")
 
 
 class ChatMessage(BaseModel):
@@ -375,8 +375,25 @@ async def prepare_vlm_messages(messages: List[ChatMessage]) -> List[Dict[str, An
                 if isinstance(part, ContentPart):
                     if part.type == "text" and part.text:
                         content_parts.append({"type": "text", "text": part.text})
+                    elif part.type == "image_url":
+                        # OpenAI-compatible format: {"type": "image_url", "image_url": {"url": "..."}}
+                        image_source = None
+                        if part.image_url and isinstance(part.image_url, dict):
+                            image_source = part.image_url.get("url")
+                        
+                        if image_source:
+                            total_image_count += 1
+                            if total_image_count > MAX_IMAGES_PER_REQUEST:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=f"Maximum {MAX_IMAGES_PER_REQUEST} images allowed across all messages in request"
+                                )
+                            
+                            # Load and validate image
+                            image = await load_image(image_source)
+                            content_parts.append({"type": "image", "image": image})
                     elif part.type == "image":
-                        # Get image source
+                        # Legacy format: {"type": "image", "image": "..."} or {"type": "image", "image_url": {"url": "..."}}
                         image_source = None
                         if part.image:
                             image_source = part.image
@@ -400,7 +417,23 @@ async def prepare_vlm_messages(messages: List[ChatMessage]) -> List[Dict[str, An
                         text_value = part.get("text", "")
                         if text_value:  # Only add non-empty text
                             content_parts.append({"type": "text", "text": text_value})
+                    elif part.get("type") == "image_url":
+                        # OpenAI format: {"type": "image_url", "image_url": {"url": "..."}}
+                        image_url_dict = part.get("image_url")
+                        if isinstance(image_url_dict, dict):
+                            image_source = image_url_dict.get("url")
+                            if image_source:
+                                total_image_count += 1
+                                if total_image_count > MAX_IMAGES_PER_REQUEST:
+                                    raise HTTPException(
+                                        status_code=400,
+                                        detail=f"Maximum {MAX_IMAGES_PER_REQUEST} images allowed across all messages in request"
+                                    )
+                                # Load and validate image
+                                image = await load_image(image_source)
+                                content_parts.append({"type": "image", "image": image})
                     elif part.get("type") == "image":
+                        # Legacy format
                         image_source = part.get("image") or (part.get("image_url", {}).get("url") if isinstance(part.get("image_url"), dict) else None)
                         if image_source:
                             total_image_count += 1

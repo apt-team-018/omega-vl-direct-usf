@@ -555,7 +555,80 @@ Health:
 curl -s http://localhost:8000/health | jq
 ```
 
-OpenAI-compatible:
+### Multi-Modal Queries (Vision-Language Model)
+
+This server supports **OpenAI-compatible multi-modal requests** with text and images. For complete documentation and examples, see [MULTIMODAL_USAGE.md](MULTIMODAL_USAGE.md).
+
+**Quick Example:**
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_SECURE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "model",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What is in this image?"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://example.com/photo.jpg"
+            }
+          }
+        ]
+      }
+    ],
+    "temperature": 0.7,
+    "max_tokens": 512
+  }'
+```
+
+**Supported Image Formats:**
+- Remote URLs: `https://example.com/image.jpg`
+- Base64 data URLs: `data:image/jpeg;base64,...`
+- Formats: JPEG, PNG, GIF, WEBP
+- Max images per request: 10 (configurable via `MAX_IMAGES_PER_REQUEST`)
+- Max image dimension: 1024px (auto-resized via `MAX_IMAGE_SIZE`)
+
+**Python Example:**
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8000/v1/chat/completions",
+    headers={
+        "Authorization": "Bearer YOUR_API_KEY",
+        "Content-Type": "application/json"
+    },
+    json={
+        "model": "model",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://example.com/image.jpg"
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+)
+print(response.json())
+```
+
+See `examples/multimodal_examples.py` for more examples.
+
+OpenAI-compatible (Text-Only):
 
 Important:
 - The model field must equal the configured display model name (MODEL_NAME). If omitted, the server assumes MODEL_NAME.
