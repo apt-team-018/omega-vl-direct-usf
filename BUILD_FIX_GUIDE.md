@@ -1,4 +1,3 @@
-
 # Docker Build Fix Guide
 
 ## Issue Summary
@@ -195,3 +194,15 @@ Before deploying to production:
 
 ## Next Steps
 
+1. **Build the image**: `docker build -t omega-vlm:latest .`
+2. **Test locally**: `docker run --rm -p 8000:8000 omega-vlm:latest`
+3. **Verify health**: `curl http://localhost:8000/health`
+4. **Test inference**: Use the `/v1/chat/completions` endpoint
+5. **Deploy**: Push to registry and deploy to production
+
+## Related Documentation
+
+- [`DOCKER_DEPLOYMENT.md`](DOCKER_DEPLOYMENT.md) - Deployment guide
+- [`QUICK_BUILD_GUIDE.md`](QUICK_BUILD_GUIDE.md) - Quick start
+- [`requirements.txt`](requirements.txt) - Python dependencies
+- [`Dockerfile`](Dockerfile) - Build configuration
