@@ -208,31 +208,6 @@ if CPU_FALLBACK:
         ATTN_IMPL = "sdpa"
 
 # -------------------------
-# API Schemas
-# -------------------------
-class GenerateParams(BaseModel):
-    max_new_tokens: Optional[int] = None
-    min_new_tokens: Optional[int] = None
-    do_sample: Optional[bool] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
-    repetition_penalty: Optional[float] = None
-    length_penalty: Optional[float] = None
-    stop: Optional[List[str]] = None  # optional stop strings
-    seed: Optional[int] = None
-
-
-class GenerateRequest(BaseModel):
-    inputs: str
-    parameters: Optional[GenerateParams] = None
-
-
-class GenerateResponse(BaseModel):
-    generated_text: str
-
-
-# -------------------------
 # OpenAI-compatible Chat API models (VLM-enhanced)
 # -------------------------
 class ContentPart(BaseModel):
@@ -274,9 +249,6 @@ class ChatCompletionRequest(BaseModel):
     # VLM-specific
     max_image_size: Optional[int] = Field(None, description="Override default max image size")
 
-
-class ApplyTemplateRequest(BaseModel):
-    messages: List[ChatMessage]
 
 
 # -------------------------
@@ -951,8 +923,6 @@ async def root():
                 "openapi": "/openapi.json",
                 "models": "/v1/models",
                 "chat_completions": "/v1/chat/completions",
-                "apply_template": "/v1/apply_template",
-                "generate": "/generate",
             },
             "auth": {
                 "protected": API_KEY != "EMPTY",
@@ -1098,39 +1068,6 @@ async def list_models():
         "data": [{"id": MODEL_NAME, "object": "model"}],
     }
 
-
-@app.post("/v1/apply_template")
-async def apply_template(req: ApplyTemplateRequest):
-    # Ensure workers are ready and processor is available
-    if not all(w.ready.is_set() for w in workers):
-        raise HTTPException(status_code=503, detail="model is still loading")
-    proc = workers[0].processor
-    if proc is None:
-        raise HTTPException(status_code=503, detail="processor not ready")
-
-    # Validate message schema
-    if not req.messages or not isinstance(req.messages, list):
-        raise HTTPException(status_code=400, detail="messages must be a non-empty list")
-    for m in req.messages:
-        role = getattr(m, "role", None)
-        if role not in {"system", "user", "assistant"}:
-            raise HTTPException(status_code=400, detail=f"invalid role: {role}")
-        if getattr(m, "content", None) is None:
-            raise HTTPException(status_code=400, detail="message content must not be null")
-
-    try:
-        # Prepare VLM messages (load images if present)
-        vlm_messages = await prepare_vlm_messages(req.messages)
-        
-        # Apply chat template
-        result = proc.apply_chat_template(
-            [vlm_messages],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        return {"prompt": result if isinstance(result, str) else str(result)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"template error: {e}")
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 async def chat_completions(req: ChatCompletionRequest):
@@ -1282,92 +1219,6 @@ async def chat_completions(req: ChatCompletionRequest):
         pass
 
     return resp
-
-
-@app.post("/generate", response_model=GenerateResponse)
-async def generate(req: GenerateRequest):
-    if not req.inputs or not req.inputs.strip():
-        raise HTTPException(status_code=400, detail="inputs must be a non-empty string")
-    # Ensure model is ready
-    if not all(w.ready.is_set() for w in workers):
-        raise HTTPException(status_code=503, detail="model is still loading")
-    rid = uuid.uuid4().hex[:8]
-    logp(f"[req] generate start id={rid}")
-
-    # Map parameters with safe defaults (no accuracy loss)
-    p = req.parameters.dict() if req.parameters else {}
-    p.setdefault("max_new_tokens", MAX_NEW_TOKENS_DEFAULT)
-    try:
-        p["max_new_tokens"] = min(int(p["max_new_tokens"]), MAX_NEW_TOKENS_DEFAULT)
-        if p["max_new_tokens"] <= 0:
-            raise ValueError
-    except Exception:
-        raise HTTPException(status_code=400, detail="max_new_tokens must be a positive integer")
-
-    p.setdefault("do_sample", DO_SAMPLE_DEFAULT)
-    if not p["do_sample"]:
-        # deterministic path — ignore sampling knobs
-        p["temperature"] = 0.0
-        p["top_p"] = 1.0
-    else:
-        # Validate and clamp sampling knobs
-        try:
-            t = float(p.get("temperature", TEMPERATURE_DEFAULT))
-        except Exception:
-            t = TEMPERATURE_DEFAULT
-        p["temperature"] = max(0.01, t)
-        try:
-            tp = float(p.get("top_p", TOP_P_DEFAULT))
-        except Exception:
-            tp = TOP_P_DEFAULT
-        p["top_p"] = min(max(tp, 1e-6), 1.0)
-    # Seed default for reproducibility (used only when sampling)
-    p.setdefault("seed", SEED_DEFAULT)
-
-    # Optional stop strings: must be array[str]
-    if "stop" in p:
-        if p["stop"] is None:
-            p.pop("stop")
-        elif isinstance(p["stop"], str):
-            raise HTTPException(status_code=400, detail="stop must be an array of strings, e.g., [] or ['...']")
-        elif isinstance(p["stop"], list):
-            if not all(isinstance(s, str) for s in p["stop"]):
-                raise HTTPException(status_code=400, detail="all stop entries must be strings")
-        else:
-            raise HTTPException(status_code=400, detail="stop must be an array of strings")
-
-    try:
-        gen_t0 = time.time()
-        gen_result = await router.generate(req.inputs, p)
-        gen_seconds = time.time() - gen_t0
-        if isinstance(gen_result, dict):
-            text = gen_result.get("text", "")
-            completion_tokens = int(gen_result.get("completion_tokens", 0))
-        else:
-            text = gen_result
-            completion_tokens = 0
-
-        # Fallback tokenization only if fast usage not available
-        if completion_tokens == 0 and not FAST_USAGE:
-            try:
-                tok = workers[0].tokenizer
-                completion_tokens = int(len(tok(text, return_tensors="pt").input_ids[0])) if tok else 0
-            except Exception:
-                completion_tokens = 0
-
-        tps = (completion_tokens / max(gen_seconds, 1e-6)) if PROGRESS_LOGS else 0.0
-        logp(
-            f"[req] generate 200 id={rid} gen={gen_seconds:.3f}s "
-            f"tokens: completion={completion_tokens} tps={tps:.1f} "
-            f"do_sample={bool(p.get('do_sample'))} temp={p.get('temperature', 0.0)} top_p={p.get('top_p', 1.0)} seed={p.get('seed')}"
-        )
-        return GenerateResponse(generated_text=text)
-    except Exception as e:
-        if DEBUG_MODE:
-            logging.exception("Generate failed id=%s", rid)
-        else:
-            logp(f"[req] generate 500 id={rid} error=\"{e}\"")
-        raise HTTPException(status_code=500, detail=f"generation failed: {e}")
 
 
 # -------------
