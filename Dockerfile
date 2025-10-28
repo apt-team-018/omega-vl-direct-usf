@@ -28,7 +28,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
  # Install base dependencies (no version constraints)
  && python3 -m pip install safetensors sentencepiece einops \
  && python3 -m pip install Pillow aiohttp orjson \
- # Install custom transformers WITHOUT dependencies
+ # Install transformers dependencies BEFORE custom transformers
+ && python3 -m pip install regex requests tqdm numpy packaging filelock \
+ # Install custom transformers WITHOUT dependencies (deps already installed above)
  && python3 -m pip install --no-deps transformers-usf-om-vl-exp-v0==0.0.1.post1 \
  && python3 -c "import accelerate; import transformers; print(f'✅ After transformers - Accelerate: {accelerate.__version__}, Transformers: {transformers.__version__}')" \
  # Install server dependencies (no version constraints)
