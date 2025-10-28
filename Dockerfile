@@ -20,7 +20,7 @@ COPY requirements.txt /app/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip \
  && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch==2.4.1 torchvision || \
-     python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch torchvision) \
+     python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch torchvision)
 
 # Copy server code
 COPY server.py /app/server.py
