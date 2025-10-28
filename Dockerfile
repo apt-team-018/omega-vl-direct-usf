@@ -22,6 +22,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
  && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch==2.4.1 torchvision || \
      python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch torchvision)
 
+# Install all application dependencies from requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install -r /app/requirements.txt
+
+# Verify critical imports (fail build early if missing)
+RUN python3 -c "import uvicorn; import fastapi; import transformers; import accelerate; print('[build] ✓ All critical packages installed successfully')"
+
 # Copy server code
 COPY server.py /app/server.py
 COPY scripts/entrypoint.sh /app/scripts/entrypoint.sh
