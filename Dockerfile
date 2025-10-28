@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
-# CUDA 12.1 + cuDNN DEVEL (includes nvcc compiler for Flash Attention compilation)
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+# CUDA 12.4 + cuDNN DEVEL (optimized for H100, includes nvcc compiler for Flash Attention compilation)
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -16,12 +16,12 @@ WORKDIR /app
 # Copy requirements first for better layer caching
 COPY requirements.txt /app/requirements.txt
 
-# Install PyTorch with CUDA 12.1 from official index (pins to 2.4 series)
+# Install PyTorch with CUDA 12.4 from official index (latest stable for H100)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip \
- && python3 -m pip install packaging ninja \
- && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch==2.4.1 || \
-     python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch) \
+ && python3 -m pip install packaging ninja wheel setuptools \
+ && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch || \
+     python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch) \
  # CRITICAL: Install custom transformers FIRST to prevent accelerate from installing standard transformers
  && python3 -m pip install transformers-usf-om-vl-exp-v0==0.0.1.post1 \
  # Now install other packages (they won't reinstall transformers)
