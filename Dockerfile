@@ -22,15 +22,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
  && python3 -m pip install packaging ninja wheel setuptools \
  && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch torchvision || \
      python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch torchvision) \
- # Install accelerate FIRST (required by transformers and server)
- && python3 -m pip install accelerate==0.34.2 \
- # Install base dependencies before custom transformers
- && python3 -m pip install safetensors>=0.4.4 sentencepiece>=0.2.0 einops>=0.7.0 \
- && python3 -m pip install Pillow>=10.0.0 aiohttp>=3.9.0 orjson>=3.9.0 \
- # CRITICAL: Install custom transformers AFTER accelerate to prevent conflicts
- && python3 -m pip install transformers-usf-om-vl-exp-v0==0.0.1.post1 \
- # Install server dependencies
- && python3 -m pip install fastapi==0.115.0 uvicorn[standard]==0.30.6 hf_transfer \
+ # Install accelerate FIRST (no version constraint - let pip choose compatible version)
+ && python3 -m pip install accelerate \
+ && python3 -c "import accelerate; print(f'✅ Accelerate installed: {accelerate.__version__}')" \
+ # Install base dependencies (no version constraints)
+ && python3 -m pip install safetensors sentencepiece einops \
+ && python3 -m pip install Pillow aiohttp orjson \
+ # Install custom transformers WITHOUT dependencies
+ && python3 -m pip install --no-deps transformers-usf-om-vl-exp-v0==0.0.1.post1 \
+ && python3 -c "import accelerate; import transformers; print(f'✅ After transformers - Accelerate: {accelerate.__version__}, Transformers: {transformers.__version__}')" \
+ # Install server dependencies (no version constraints)
+ && python3 -m pip install fastapi "uvicorn[standard]" hf_transfer \
  # Skip Flash Attention - use PyTorch SDPA (built-in, fast on H100)
  && echo "==== Attention Configuration ====" \
  && python3 -c "import torch; print(f'PyTorch: {torch.__version__} | CUDA: {torch.version.cuda}')" \
