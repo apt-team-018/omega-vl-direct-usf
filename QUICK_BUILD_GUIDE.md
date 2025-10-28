@@ -134,14 +134,13 @@ ENV ATTN_IMPL=sdpa
 
 ```bash
 # Build
-docker build -t your-registry.io/omega-vlm:v0.0.3 .
-
+docker build -t arpitsh018/omega-vlm:v0.0.3 .
 # Verify
-docker run --rm your-registry.io/omega-vlm:v0.0.3 \
+docker run --rm arpitsh018/omega-vlm:v0.0.3 \
   python3 -c "import torch; print(f'PyTorch {torch.__version__}')"
 
 # Push
-docker push your-registry.io/omega-vlm:v0.0.3
+docker push arpitsh018/omega-vlm:v0.0.3
 ```
 
 ### Kubernetes Deployment

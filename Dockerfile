@@ -20,8 +20,8 @@ COPY requirements.txt /app/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip \
  && python3 -m pip install packaging ninja wheel setuptools \
- && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch || \
-     python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch) \
+ && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch torchvision || \
+     python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch torchvision) \
  # CRITICAL: Install custom transformers FIRST to prevent accelerate from installing standard transformers
  && python3 -m pip install transformers-usf-om-vl-exp-v0==0.0.1.post1 \
  # Now install other packages (they won't reinstall transformers)
