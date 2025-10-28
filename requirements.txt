@@ -1,7 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 git+https://github.com/apt-team-018/transformers-usf-exp.git
-accelerate==0.34.2
+accelerate
 # hf_transfer==0.1.6
 # Note: transformers will be installed from git repository in Dockerfile
 safetensors>=0.4.4

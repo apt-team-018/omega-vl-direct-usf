@@ -21,11 +21,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip \
  && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch==2.4.1 torchvision || \
      python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch torchvision) \
- # Install deps (flash-attn may fail depending on CUDA/driver/toolchain; we tolerate failure)
- && (python3 -m pip install -r /app/requirements.txt || true) \
- # Ensure core deps are present even if flash-attn failed to build
- && python3 -m pip install fastapi uvicorn[standard] accelerate hf_transfer safetensors sentencepiece einops orjson Pillow aiohttp \
- && python3 -m pip install --upgrade "git+https://github.com/apt-team-018/transformers-usf-exp.git"
 
 # Copy server code
 COPY server.py /app/server.py
