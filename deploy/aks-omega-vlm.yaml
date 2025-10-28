@@ -1,0 +1,133 @@
+# Azure AKS deployment for omega-vlm-inference-engine
+# Includes:
+# - Secret for API_KEY
+# - Deployment requesting 8 NVIDIA GPUs and passing desired runtime flags
+# - LoadBalancer Service exposing port 80 -> 8000
+# - PVC mount for model files at /models (update PVC name as needed)
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: omega-llm-secret
+  labels:
+    app: omega-llm
+type: Opaque
+stringData:
+  # TODO: Replace with a strong token before applying
+  apiKey: "YOUR_SECURE_TOKEN"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omega-llm
+  labels:
+    app: omega-llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: omega-llm
+  template:
+    metadata:
+      labels:
+        app: omega-llm
+    spec:
+      # Ensure this schedules to GPU nodes in AKS
+      nodeSelector:
+        kubernetes.azure.com/accelerator: nvidia
+        kubernetes.io/arch: amd64
+      # Tolerate common GPU taints if present
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: server
+          image: docker.io/arpitsh018/omega-vlm-inference-engine:v0.2.13
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: omega-llm-secret
+                  key: apiKey
+          args:
+            # Requested runtime flags:
+            - "--model-name"
+            - "omega"
+            - "--gpu-count"
+            - "8"
+            - "--model-path"
+            - "/models/model_path"
+            - "--dtype"
+            - "bf16"
+            - "--attn-impl"
+            - "flash_attention_2"
+            - "--max-batch-size"
+            - "8"
+            - "--batch-timeout-ms"
+            - "6"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8000"
+            - "--default-temperature"
+            - "0.8"
+            - "--default-top-p"
+            - "0.95"
+            - "--default-seed"
+            - "42"
+          # Request GPUs present on the node
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+            # Optionally request CPU/memory as well:
+            # requests:
+            #   cpu: "4"
+            #   memory: "16Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+          volumeMounts:
+            # Mount a PVC at /models so the container can access local model files
+            - name: model-store
+              mountPath: /models
+      volumes:
+        - name: model-store
+          persistentVolumeClaim:
+            # TODO: Replace with your actual PVC name that contains the model path directory
+            claimName: model-store-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: omega-llm
+  labels:
+    app: omega-llm
+  # For Azure AKS customization you may add annotations, e.g.:
+  # annotations:
+  #   service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  selector:
+    app: omega-llm
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
