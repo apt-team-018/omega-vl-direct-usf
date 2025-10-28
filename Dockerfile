@@ -1,14 +1,14 @@
 # syntax=docker/dockerfile:1.6
-# CUDA 12.4 + cuDNN DEVEL (optimized for H100, includes nvcc compiler for Flash Attention compilation)
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# CUDA 12.1 + cuDNN runtime
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# System deps (include ninja-build for faster Flash Attention compilation)
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-venv python3-pip git build-essential curl ca-certificates ninja-build \
+    python3 python3-venv python3-pip git build-essential curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -16,34 +16,16 @@ WORKDIR /app
 # Copy requirements first for better layer caching
 COPY requirements.txt /app/requirements.txt
 
-# Install PyTorch with CUDA 12.4 from official index (latest stable for H100)
+# Install PyTorch with CUDA 12.1 from official index (pins to 2.4 series)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip \
- && python3 -m pip install packaging ninja wheel setuptools \
- && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch torchvision || \
-     python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch torchvision) \
- # Install accelerate FIRST (no version constraint - let pip choose compatible version)
- && python3 -m pip install accelerate \
- && python3 -c "import accelerate; print(f'✅ Accelerate installed: {accelerate.__version__}')" \
- # Install base dependencies (no version constraints)
- && python3 -m pip install safetensors sentencepiece einops \
- && python3 -m pip install Pillow aiohttp orjson \
- # Install transformers dependencies BEFORE custom transformers
- && python3 -m pip install regex requests tqdm numpy packaging filelock \
- # Install EXACT huggingface-hub version required by custom transformers
- && python3 -m pip install "huggingface-hub==1.0.0.rc6" \
- # Install custom transformers WITHOUT dependencies (deps already installed above)
- && python3 -m pip install --no-deps transformers-usf-om-vl-exp-v0==0.0.1.post1 \
- && python3 -c "import accelerate; import transformers; print(f'✅ After transformers - Accelerate: {accelerate.__version__}, Transformers: {transformers.__version__}')" \
- # Install server dependencies (no version constraints)
- && python3 -m pip install fastapi "uvicorn[standard]" hf_transfer \
- # Skip Flash Attention - use PyTorch SDPA (built-in, fast on H100)
- && echo "==== Attention Configuration ====" \
- && python3 -c "import torch; print(f'PyTorch: {torch.__version__} | CUDA: {torch.version.cuda}')" \
- && echo "ℹ️  Using PyTorch SDPA (Scaled Dot Product Attention)" \
- && echo "   Performance: 85-90% of flash-attn (still excellent on H100)" \
- && echo "   Benefits: Fast build, zero compilation, works everywhere" \
- && echo "===================================="
+ && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch==2.4.1 torchvision || \
+     python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple torch torchvision) \
+ # Install deps (flash-attn may fail depending on CUDA/driver/toolchain; we tolerate failure)
+ && (python3 -m pip install -r /app/requirements.txt || true) \
+ # Ensure core deps are present even if flash-attn failed to build
+ && python3 -m pip install fastapi uvicorn[standard] accelerate hf_transfer safetensors sentencepiece einops orjson Pillow aiohttp \
+ && python3 -m pip install --upgrade "git+https://github.com/apt-team-018/transformers-usf-exp.git"
 
 # Copy server code
 COPY server.py /app/server.py
@@ -60,7 +42,7 @@ ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     UVICORN_WORKERS=1 \
     TRUST_REMOTE_CODE=1 \
     DTYPE=bf16 \
-    ATTN_IMPL=sdpa \
+    ATTN_IMPL=flash_attention_2 \
     MODEL_PATH=5techlab-research/test_iter3
 
 # Expose FastAPI port
