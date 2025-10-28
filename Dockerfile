@@ -22,13 +22,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
  && python3 -m pip install packaging ninja wheel setuptools \
  && (python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch torchvision || \
      python3 -m pip install --prefer-binary --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple torch torchvision) \
- # CRITICAL: Install custom transformers FIRST to prevent accelerate from installing standard transformers
- && python3 -m pip install transformers-usf-om-vl-exp-v0==0.0.1.post1 \
- # Now install other packages (they won't reinstall transformers)
- && python3 -m pip install fastapi==0.115.0 uvicorn[standard]==0.30.6 \
- && python3 -m pip install accelerate==0.34.2 hf_transfer \
+ # Install accelerate FIRST (required by transformers and server)
+ && python3 -m pip install accelerate==0.34.2 \
+ # Install base dependencies before custom transformers
  && python3 -m pip install safetensors>=0.4.4 sentencepiece>=0.2.0 einops>=0.7.0 \
  && python3 -m pip install Pillow>=10.0.0 aiohttp>=3.9.0 orjson>=3.9.0 \
+ # CRITICAL: Install custom transformers AFTER accelerate to prevent conflicts
+ && python3 -m pip install transformers-usf-om-vl-exp-v0==0.0.1.post1 \
+ # Install server dependencies
+ && python3 -m pip install fastapi==0.115.0 uvicorn[standard]==0.30.6 hf_transfer \
  # Skip Flash Attention - use PyTorch SDPA (built-in, fast on H100)
  && echo "==== Attention Configuration ====" \
  && python3 -c "import torch; print(f'PyTorch: {torch.__version__} | CUDA: {torch.version.cuda}')" \
