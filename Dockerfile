@@ -30,6 +30,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
  && python3 -m pip install Pillow aiohttp orjson \
  # Install transformers dependencies BEFORE custom transformers
  && python3 -m pip install regex requests tqdm numpy packaging filelock \
+ # Install EXACT huggingface-hub version required by custom transformers
+ && python3 -m pip install "huggingface-hub==1.0.0.rc6" \
  # Install custom transformers WITHOUT dependencies (deps already installed above)
  && python3 -m pip install --no-deps transformers-usf-om-vl-exp-v0==0.0.1.post1 \
  && python3 -c "import accelerate; import transformers; print(f'✅ After transformers - Accelerate: {accelerate.__version__}, Transformers: {transformers.__version__}')" \
