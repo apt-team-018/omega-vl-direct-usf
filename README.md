@@ -555,6 +555,72 @@ Health:
 curl -s http://localhost:8000/health | jq
 ```
 
+### Streaming Support (OpenAI-Compatible)
+
+This server supports **token-by-token streaming** in OpenAI-compatible SSE format for both text-only and multi-modal requests.
+
+**Quick Example:**
+```python
+import requests
+import json
+
+response = requests.post(
+    "http://localhost:8000/v1/chat/completions",
+    headers={
+        "Authorization": "Bearer YOUR_API_KEY",
+        "Content-Type": "application/json"
+    },
+    json={
+        "model": "model",
+        "messages": [{"role": "user", "content": "Write a poem"}],
+        "stream": True,
+        "temperature": 0.8,
+        "max_tokens": 256
+    },
+    stream=True
+)
+
+for line in response.iter_lines():
+    if line:
+        line = line.decode('utf-8')
+        if line.startswith('data: '):
+            data = line[6:]
+            if data == '[DONE]':
+                break
+            chunk = json.loads(data)
+            if 'choices' in chunk:
+                delta = chunk['choices'][0].get('delta', {})
+                if 'content' in delta:
+                    print(delta['content'], end='', flush=True)
+```
+
+**cURL Example:**
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -N \
+  -d '{
+    "model": "model",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+```
+
+**Key Features:**
+- Server-Sent Events (SSE) format matching OpenAI
+- Token-by-token generation with `delta` updates
+- Final chunk includes `finish_reason` and `usage` statistics
+- Stream ends with `data: [DONE]`
+- Supports both text-only and multimodal (text + images)
+- Compatible with OpenAI Python SDK and other clients
+
+**See [`examples/streaming_examples.py`](examples/streaming_examples.py) for comprehensive examples including:**
+- Basic text streaming
+- Streaming with images (URL and base64)
+- Multi-turn conversations
+- Using sseclient library for cleaner parsing
+
 ### Multi-Modal Queries (Vision-Language Model)
 
 This server supports **OpenAI-compatible multi-modal requests** with text and images. For complete documentation and examples, see [MULTIMODAL_USAGE.md](MULTIMODAL_USAGE.md).

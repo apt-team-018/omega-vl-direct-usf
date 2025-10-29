@@ -6,8 +6,9 @@ import logging
 import io
 import base64
 import aiohttp
+import json
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
-from typing import List, Optional, Dict, Any, Tuple, Union
+from typing import List, Optional, Dict, Any, Tuple, Union, AsyncGenerator
 from dataclasses import dataclass
 
 import torch
@@ -673,13 +674,23 @@ class GPUWorker:
                 batch: List[_PendingReq] = [first]
                 t0 = time.time()
 
-                # Collect up to MAX_BATCH_SIZE or BATCH_TIMEOUT_MS
+                # For streaming requests, process immediately without batching
+                if first.is_stream:
+                    await self._run_streaming_batch([first])
+                    continue
+
+                # Collect up to MAX_BATCH_SIZE or BATCH_TIMEOUT_MS for non-streaming
                 while len(batch) < MAX_BATCH_SIZE:
                     timeout_left = (BATCH_TIMEOUT_MS / 1000.0) - (time.time() - t0)
                     if timeout_left <= 0:
                         break
                     try:
                         nxt = await asyncio.wait_for(self.queue.get(), timeout=timeout_left)
+                        # Don't mix streaming and non-streaming in the same batch
+                        if nxt.is_stream:
+                            # Put it back for the next iteration
+                            await self.queue.put(nxt)
+                            break
                         batch.append(nxt)
                     except asyncio.TimeoutError:
                         break
@@ -852,6 +863,127 @@ class GPUWorker:
                     "prompt_tokens": prompt_tok_count,
                     "completion_tokens": completion_tok_count,
                 })
+
+
+    async def _run_streaming_batch(self, batch: List[_PendingReq]):
+        """Process VLM batch with streaming support."""
+        assert self.model is not None and self.processor is not None
+
+        # Only support batch size of 1 for streaming
+        if len(batch) != 1:
+            for req in batch:
+                if not req.future.done():
+                    req.future.set_exception(
+                        HTTPException(status_code=400, detail="Streaming only supports batch size of 1")
+                    )
+            return
+
+        req = batch[0]
+        messages_list = [req.messages]
+        params = req.params
+
+        # Extract generation parameters
+        max_new_tokens = min(int(params.get("max_new_tokens", MAX_NEW_TOKENS_DEFAULT)), MAX_NEW_TOKENS_DEFAULT)
+        min_new_tokens = int(params.get("min_new_tokens", 1))
+        do_sample = bool(params.get("do_sample", DO_SAMPLE_DEFAULT))
+        
+        # Sampling parameters
+        if do_sample:
+            temperature = float(params.get("temperature", TEMPERATURE_DEFAULT))
+            temperature = max(0.01, min(temperature, 2.0))
+            top_p = float(params.get("top_p", TOP_P_DEFAULT))
+            top_p = max(0.0, min(top_p, 1.0))
+            top_k = int(params.get("top_k", TOP_K_DEFAULT))
+            top_k = max(0, top_k)
+            repetition_penalty = float(params.get("repetition_penalty", REPETITION_PENALTY_DEFAULT))
+            repetition_penalty = max(1.0, min(repetition_penalty, 2.0))
+            length_penalty = params.get("length_penalty", 1.0)
+            length_penalty = max(-2.0, min(length_penalty, 2.0))
+        else:
+            temperature = 0.0
+            top_p = 1.0
+            top_k = 0
+            repetition_penalty = 1.0
+            length_penalty = 1.0
+
+        # Apply chat template
+        try:
+            inputs = self.processor.apply_chat_template(
+                messages_list,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt"
+            ).to(self.model.device)
+        except Exception as e:
+            if not req.future.done():
+                req.future.set_exception(
+                    HTTPException(status_code=500, detail=f"Failed to process VLM inputs: {e}")
+                )
+            return
+
+        # Get prompt length for token counting
+        prompt_length = inputs["input_ids"].shape[1]
+        
+        # Seed for reproducibility
+        batch_seed = int(params.get("seed", SEED_DEFAULT))
+        if do_sample:
+            try:
+                torch.manual_seed(batch_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(batch_seed)
+            except Exception:
+                pass
+
+        # Create streamer
+        streamer = TextIteratorStreamer(
+            self.processor.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )
+
+        # Prepare generation kwargs
+        gen_kwargs = {
+            **inputs,
+            "max_new_tokens": max_new_tokens,
+            "min_new_tokens": min_new_tokens,
+            "do_sample": do_sample,
+            "use_cache": True,
+            "pad_token_id": self.processor.tokenizer.pad_token_id,
+            "eos_token_id": self.processor.tokenizer.eos_token_id,
+            "streamer": streamer,
+        }
+        
+        if do_sample:
+            gen_kwargs.update({
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+                "length_penalty": length_penalty,
+            })
+
+        # Start generation in a separate thread
+        def generate_fn():
+            with torch.inference_mode():
+                try:
+                    self.model.generate(**gen_kwargs)
+                except Exception as e:
+                    # Error will be caught by streamer iteration
+                    pass
+
+        generation_thread = Thread(target=generate_fn)
+        generation_thread.start()
+
+        # Set the streamer and metadata as result
+        if not req.future.done():
+            req.future.set_result({
+                "streamer": streamer,
+                "prompt_tokens": prompt_length,
+                "generation_thread": generation_thread,
+                "stop_strings": params.get("stop", []),
+            })
 
 
 # -------------------------
@@ -1102,6 +1234,132 @@ async def list_models():
     }
 
 
+async def stream_response(
+    streamer: TextIteratorStreamer,
+    generation_thread: Thread,
+    stop_strings: List[str],
+    prompt_tokens: int,
+    request_id: str,
+    model_name: str,
+) -> AsyncGenerator[str, None]:
+    """Generate SSE-formatted streaming responses in OpenAI format."""
+    
+    try:
+        completion_tokens = 0
+        full_text = ""
+        
+        # Send initial chunk
+        chunk_data = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": ""},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {json.dumps(chunk_data)}\n\n"
+        
+        # Stream tokens
+        for token_text in streamer:
+            if not token_text:
+                continue
+                
+            full_text += token_text
+            completion_tokens += 1
+            
+            # Check for stop strings
+            should_stop = False
+            for stop_str in stop_strings:
+                if stop_str and stop_str in full_text:
+                    # Truncate at stop string
+                    stop_idx = full_text.index(stop_str)
+                    remaining = full_text[:stop_idx]
+                    if remaining and remaining != full_text:
+                        chunk_data = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": remaining[len(full_text) - len(token_text):]},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk_data)}\n\n"
+                    should_stop = True
+                    break
+            
+            if should_stop:
+                break
+            
+            # Send token chunk
+            chunk_data = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": token_text},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk_data)}\n\n"
+        
+        # Wait for generation thread to complete
+        generation_thread.join(timeout=1.0)
+        
+        # Send final chunk with finish reason and usage
+        final_chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+        }
+        yield f"data: {json.dumps(final_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+        
+    except Exception as e:
+        error_chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "error",
+                }
+            ],
+            "error": str(e)
+        }
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 async def chat_completions(req: ChatCompletionRequest):
     # Ensure workers are ready
@@ -1129,10 +1387,6 @@ async def chat_completions(req: ChatCompletionRequest):
     # Only n=1 supported
     if req.n is not None and int(req.n) != 1:
         raise HTTPException(status_code=400, detail="Only n=1 is supported")
-    
-    # Streaming support check
-    if req.stream:
-        raise HTTPException(status_code=400, detail="stream=true not yet implemented for VLM")
 
     # Enforce model name contract
     req_model = req.model if req.model is not None else MODEL_NAME
@@ -1189,10 +1443,34 @@ async def chat_completions(req: ChatCompletionRequest):
     if stop_list:
         params["stop"] = stop_list
 
-    # Generate
+    # Generate with streaming or non-streaming
     try:
         gen_t0 = time.time()
         gen_result = await router.generate_vlm(vlm_messages, params, is_stream=req.stream)
+        
+        # Handle streaming response
+        if req.stream:
+            request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+            logp(f"[req] chat stream id={rid} request_id={request_id}")
+            
+            return StreamingResponse(
+                stream_response(
+                    streamer=gen_result["streamer"],
+                    generation_thread=gen_result["generation_thread"],
+                    stop_strings=gen_result.get("stop_strings", []),
+                    prompt_tokens=gen_result.get("prompt_tokens", 0),
+                    request_id=request_id,
+                    model_name=MODEL_NAME,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+            )
+        
+        # Handle non-streaming response
         gen_seconds = time.time() - gen_t0
         
         if isinstance(gen_result, dict):
