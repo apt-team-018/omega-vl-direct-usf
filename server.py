@@ -1354,31 +1354,46 @@ async def stream_response(
         }
         yield f"data: {json.dumps(chunk_data)}\n\n"
         
-        # Stream tokens
+        # Stream tokens asynchronously to prevent buffering
         # NOTE: Stop strings are now handled at engine level via StoppingCriteria
         # No need to check/truncate here - generation stops automatically
-        for token_text in streamer:
-            if not token_text:
-                continue
+        
+        loop = asyncio.get_event_loop()
+        streamer_iter = iter(streamer)
+        
+        while True:
+            try:
+                # Get next token without blocking the event loop
+                token_text = await loop.run_in_executor(None, next, streamer_iter)
                 
-            full_text += token_text
-            completion_tokens += 1
-            
-            # Send token chunk
-            chunk_data = {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": token_text},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(chunk_data)}\n\n"
+                if not token_text:
+                    continue
+                    
+                full_text += token_text
+                completion_tokens += 1
+                
+                # Send token chunk immediately
+                chunk_data = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": token_text},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(chunk_data)}\n\n"
+                
+                # Yield control to event loop to ensure immediate sending
+                await asyncio.sleep(0)
+                
+            except StopIteration:
+                # No more tokens from generator
+                break
         
         # Wait for generation thread to complete and check for errors
         generation_thread.join(timeout=2.0)
