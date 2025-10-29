@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, ORJSONResponse, StreamingResponse
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
-from transformers import AutoProcessor, Omega17VLExpForConditionalGeneration, TextIteratorStreamer
+from transformers import AutoProcessor, Omega17VLExpForConditionalGeneration, TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList
 from transformers.utils import logging as tf_logging
 from PIL import Image
 from io import BytesIO
@@ -476,6 +476,54 @@ def _extract_text_from_content(content: Any) -> str:
                 parts.append(part.text)
         return "".join(parts)
     return str(content)
+
+# -------------------------
+# Custom Stopping Criteria for Stop Strings
+# -------------------------
+class StopStringCriteria(StoppingCriteria):
+    """
+    Custom stopping criteria that stops generation when any stop string is found.
+    
+    This allows efficient stop string handling at the engine level (like vLLM/TGI),
+    rather than post-processing, which wastes GPU compute.
+    """
+    
+    def __init__(self, tokenizer, stop_strings: List[str], prompt_length: int):
+        self.tokenizer = tokenizer
+        self.stop_strings = [s for s in stop_strings if s]  # Filter empty strings
+        self.prompt_length = prompt_length
+        
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor, **kwargs) -> bool:
+        """Check if any stop string appears in the generated text."""
+        if not self.stop_strings:
+            return False
+        
+        # Decode only the generated part (skip prompt)
+        generated_ids = input_ids[0][self.prompt_length:]
+        
+        # Skip if nothing generated yet
+        if len(generated_ids) == 0:
+            return False
+        
+        try:
+            # Decode the generated text
+            decoded_text = self.tokenizer.decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False
+            )
+            
+            # Check if any stop string appears
+            for stop_str in self.stop_strings:
+                if stop_str in decoded_text:
+                    return True  # Stop generation
+            
+            return False  # Continue generation
+        except Exception:
+            # If decoding fails, continue generation
+            return False
+
+
 # -------------------------
 # Request envelope for batching (VLM-enhanced)
 # -------------------------
@@ -789,6 +837,29 @@ class GPUWorker:
             except Exception:
                 pass
 
+        # Prepare stopping criteria for stop strings
+        stopping_criteria = None
+        stop_strings_list = []
+        for p in params_list:
+            stops = p.get("stop", [])
+            if isinstance(stops, str):
+                stops = [stops]
+            elif not isinstance(stops, list):
+                stops = []
+            stop_strings_list.extend([s for s in stops if s])
+        
+        # Remove duplicates and create stopping criteria if needed
+        if stop_strings_list:
+            unique_stops = list(set(stop_strings_list))
+            prompt_length = inputs["input_ids"].shape[1]
+            stopping_criteria = StoppingCriteriaList([
+                StopStringCriteria(
+                    self.processor.tokenizer,
+                    unique_stops,
+                    prompt_length
+                )
+            ])
+
         # Generate with VLM model
         with torch.inference_mode():
             try:
@@ -810,6 +881,10 @@ class GPUWorker:
                         "repetition_penalty": repetition_penalty,
                         "length_penalty": length_penalty,
                     })
+                
+                # Add stopping criteria if stop strings are present
+                if stopping_criteria:
+                    gen_kwargs["stopping_criteria"] = stopping_criteria
                 
                 outputs = self.model.generate(**gen_kwargs)
             except Exception as e:
@@ -833,25 +908,10 @@ class GPUWorker:
         )
 
         # Set results for each request
+        # NOTE: Stop strings are already handled by StoppingCriteria during generation
+        # No need for post-processing truncation
         for i, req in enumerate(batch):
             text = decoded_texts[i]
-            
-            # Apply stop strings
-            stops = req.params.get("stop") or []
-            if isinstance(stops, str):
-                stops = [stops]
-            elif not isinstance(stops, list):
-                stops = []
-            
-            cut_idx = None
-            for s in stops:
-                if not s:
-                    continue
-                j = text.find(s)
-                if j != -1:
-                    cut_idx = j if cut_idx is None else min(cut_idx, j)
-            if cut_idx is not None:
-                text = text[:cut_idx]
 
             # Token counts
             prompt_tok_count = int(lengths[i].item()) if i < len(lengths) else 0
@@ -935,6 +995,26 @@ class GPUWorker:
             except Exception:
                 pass
 
+        # Prepare stopping criteria for stop strings
+        stopping_criteria = None
+        stop_list = params.get("stop", [])
+        if isinstance(stop_list, str):
+            stop_list = [stop_list]
+        elif not isinstance(stop_list, list):
+            stop_list = []
+        
+        # Create stopping criteria if stop strings are present
+        if stop_list:
+            unique_stops = [s for s in stop_list if s]
+            if unique_stops:
+                stopping_criteria = StoppingCriteriaList([
+                    StopStringCriteria(
+                        self.processor.tokenizer,
+                        unique_stops,
+                        prompt_length
+                    )
+                ])
+
         # Create streamer
         streamer = TextIteratorStreamer(
             self.processor.tokenizer,
@@ -963,6 +1043,10 @@ class GPUWorker:
                 "repetition_penalty": repetition_penalty,
                 "length_penalty": length_penalty,
             })
+        
+        # Add stopping criteria if stop strings are present
+        if stopping_criteria:
+            gen_kwargs["stopping_criteria"] = stopping_criteria
 
         # Start generation in a separate thread
         def generate_fn():
@@ -1242,13 +1326,19 @@ async def stream_response(
     request_id: str,
     model_name: str,
 ) -> AsyncGenerator[str, None]:
-    """Generate SSE-formatted streaming responses in OpenAI format."""
+    """
+    Generate SSE-formatted streaming responses in OpenAI format.
+    
+    NOTE: Once streaming starts, HTTP status is already 200. Errors during
+    generation are communicated via error chunks in the SSE stream.
+    """
     
     try:
         completion_tokens = 0
         full_text = ""
+        generation_error = None
         
-        # Send initial chunk
+        # Send initial chunk with role
         chunk_data = {
             "id": request_id,
             "object": "chat.completion.chunk",
@@ -1265,40 +1355,14 @@ async def stream_response(
         yield f"data: {json.dumps(chunk_data)}\n\n"
         
         # Stream tokens
+        # NOTE: Stop strings are now handled at engine level via StoppingCriteria
+        # No need to check/truncate here - generation stops automatically
         for token_text in streamer:
             if not token_text:
                 continue
                 
             full_text += token_text
             completion_tokens += 1
-            
-            # Check for stop strings
-            should_stop = False
-            for stop_str in stop_strings:
-                if stop_str and stop_str in full_text:
-                    # Truncate at stop string
-                    stop_idx = full_text.index(stop_str)
-                    remaining = full_text[:stop_idx]
-                    if remaining and remaining != full_text:
-                        chunk_data = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": remaining[len(full_text) - len(token_text):]},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk_data)}\n\n"
-                    should_stop = True
-                    break
-            
-            if should_stop:
-                break
             
             # Send token chunk
             chunk_data = {
@@ -1316,10 +1380,15 @@ async def stream_response(
             }
             yield f"data: {json.dumps(chunk_data)}\n\n"
         
-        # Wait for generation thread to complete
-        generation_thread.join(timeout=1.0)
+        # Wait for generation thread to complete and check for errors
+        generation_thread.join(timeout=2.0)
+        
+        # Check if thread is still alive (generation timeout)
+        if generation_thread.is_alive():
+            generation_error = "Generation timeout"
         
         # Send final chunk with finish reason and usage
+        finish_reason = "error" if generation_error else "stop"
         final_chunk = {
             "id": request_id,
             "object": "chat.completion.chunk",
@@ -1329,7 +1398,7 @@ async def stream_response(
                 {
                     "index": 0,
                     "delta": {},
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": {
@@ -1338,10 +1407,24 @@ async def stream_response(
                 "total_tokens": prompt_tokens + completion_tokens,
             }
         }
+        
+        # Add error details if present
+        if generation_error:
+            final_chunk["error"] = {
+                "message": generation_error,
+                "type": "generation_error",
+                "code": "generation_failed"
+            }
+        
         yield f"data: {json.dumps(final_chunk)}\n\n"
         yield "data: [DONE]\n\n"
         
     except Exception as e:
+        # Exception during streaming - send error chunk
+        # NOTE: HTTP status is already 200 at this point
+        if DEBUG_MODE:
+            logging.exception("Streaming error")
+        
         error_chunk = {
             "id": request_id,
             "object": "chat.completion.chunk",
@@ -1354,7 +1437,11 @@ async def stream_response(
                     "finish_reason": "error",
                 }
             ],
-            "error": str(e)
+            "error": {
+                "message": str(e),
+                "type": "stream_error",
+                "code": "internal_error"
+            }
         }
         yield f"data: {json.dumps(error_chunk)}\n\n"
         yield "data: [DONE]\n\n"
@@ -1362,14 +1449,28 @@ async def stream_response(
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
 async def chat_completions(req: ChatCompletionRequest):
-    # Ensure workers are ready
+    # Measure total request time
+    req_start = time.time()
+    rid = uuid.uuid4().hex[:8]
+    
+    # CRITICAL: All validation must happen BEFORE starting streaming response
+    # to ensure proper HTTP status codes are returned
+    
+    # Check 1: Ensure workers are ready (503 if not)
     if not all(w.ready.is_set() for w in workers):
         raise HTTPException(status_code=503, detail="model is still loading")
+    
+    # Check 2: Ensure startup was successful (503 if failed)
+    if not STARTUP_OK:
+        error_msg = f"model failed to load: {STARTUP_ERROR}" if STARTUP_ERROR else "model not ready"
+        raise HTTPException(status_code=503, detail=error_msg)
+    
+    # Check 3: Verify processor is ready (503 if not)
     proc = workers[0].processor
     if proc is None:
         raise HTTPException(status_code=503, detail="processor not ready")
 
-    # Validate message schema
+    # Check 4: Validate message schema (400 for bad requests)
     if not req.messages or not isinstance(req.messages, list):
         raise HTTPException(status_code=400, detail="messages must be a non-empty list")
     for m in req.messages:
@@ -1379,21 +1480,22 @@ async def chat_completions(req: ChatCompletionRequest):
         if getattr(m, "content", None) is None:
             raise HTTPException(status_code=400, detail="message content must not be null")
 
-    # Measure total request time
-    req_start = time.time()
-    rid = uuid.uuid4().hex[:8]
-    logp(f"[req] chat start id={rid} model={MODEL_NAME}")
-
-    # Only n=1 supported
+    # Check 5: Only n=1 supported (400 for bad request)
     if req.n is not None and int(req.n) != 1:
         raise HTTPException(status_code=400, detail="Only n=1 is supported")
 
-    # Enforce model name contract
+    # Check 6: Enforce model name contract (400 for bad request)
     req_model = req.model if req.model is not None else MODEL_NAME
     if req_model != MODEL_NAME:
         raise HTTPException(status_code=400, detail=f"invalid model: expected '{MODEL_NAME}'")
 
-    # Prepare VLM messages (load images if present)
+    # Check 7: Check server overload before processing (503 if overloaded)
+    if router.is_overloaded():
+        raise HTTPException(status_code=503, detail="server overloaded: queue full")
+
+    logp(f"[req] chat start id={rid} model={MODEL_NAME} stream={req.stream}")
+
+    # Check 8: Prepare VLM messages - validate and load images (400 for bad data)
     try:
         vlm_messages = await prepare_vlm_messages(req.messages)
     except HTTPException:
@@ -1512,12 +1614,9 @@ async def chat_completions(req: ChatCompletionRequest):
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
-    
-    # Add total latency
-    total_latency = time.time() - req_start
-    resp["latency_seconds"] = round(total_latency, 4)
 
-    # Log metrics
+    # Log metrics (internal only, not in response)
+    total_latency = time.time() - req_start
     try:
         tps = (completion_tokens / max(gen_seconds, 1e-6)) if PROGRESS_LOGS else 0.0
         logp(

@@ -1,4 +1,65 @@
 # GPU-Optimized LLM FastAPI Server (Dockerized)
+## 🚀 New Features & Capabilities
+
+### Token-by-Token Streaming ✨
+- **OpenAI-Compatible SSE Format** - Exact same format as ChatGPT API
+- **Works with Images** - Stream responses for both text and multimodal inputs
+- **Proper Error Codes** - Returns 400/503 before streaming, errors in SSE stream during generation
+- **Example**: See [`examples/streaming_examples.py`](examples/streaming_examples.py)
+
+```python
+# Stream tokens as they're generated
+response = requests.post(
+    "http://localhost:8000/v1/chat/completions",
+    json={
+        "model": "model",
+        "messages": [{"role": "user", "content": "Write a poem"}],
+        "stream": True  # Enable streaming
+    },
+    stream=True
+)
+
+for line in response.iter_lines():
+    if line and line.startswith(b'data: '):
+        data = line[6:].decode('utf-8')
+        if data != '[DONE]':
+            chunk = json.loads(data)
+            print(chunk['choices'][0]['delta'].get('content', ''), end='')
+```
+
+### Efficient Stop String Handling 🎯
+- **Engine-Level Stopping** - Uses Transformers `StoppingCriteria` API
+- **No Wasted Compute** - Generation stops immediately at stop strings (like vLLM/TGI)
+- **Works with Streaming** - Compatible with both streaming and non-streaming modes
+- **Production-Grade** - Same behavior as production inference engines
+
+```python
+# Generation stops at "STOP" - no wasted GPU cycles
+{
+    "messages": [...],
+    "stop": ["STOP", "User:", "\n\n"]  # Stops at any of these
+}
+```
+
+### Multi-Modal Vision-Language Support 🖼️
+- **Text + Images** - Send images with text in same request
+- **Multiple Formats** - URLs, base64 data URIs, JPEG/PNG/GIF/WEBP
+- **Configurable Limits** - Up to 10 images per request (configurable)
+- **Auto-Resize** - Images resized to 1024px max dimension
+- **OpenAI Format** - Same API as GPT-4 Vision
+
+```python
+{
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What's in this image?"},
+            {"type": "image_url", "image_url": {"url": "https://..."}}
+        ]
+    }]
+}
+```
+
 
 Production-grade FastAPI server for Transformers and local model folders with:
 - Local model folder or registry-style model ID via MODEL_PATH
@@ -13,8 +74,6 @@ Production-grade FastAPI server for Transformers and local model folders with:
 
 Endpoints:
 - OpenAI-compatible: POST /v1/chat/completions (protected when API_KEY is set)
-- Simple generation: POST /generate
-- Apply chat template: POST /v1/apply_template
 - Models list: GET /v1/models (protected when API_KEY is set)
 - Health: GET /health
 
@@ -155,7 +214,7 @@ curl http://YOUR_VM_IP:8000/health
 
 ## Low-latency defaults (v0.2.13)
 
-This image ships with low-latency settings enabled by default to reduce overhead on the /v1/chat/completions and /generate paths.
+This image ships with low-latency settings enabled by default to reduce overhead on the /v1/chat/completions path.
 
 Defaults:
 - MAX_BATCH_SIZE=1 (micro-batching off)
@@ -723,29 +782,6 @@ Defaults when omitted:
 - stream: false
 - Sampling default is controlled by DO_SAMPLE_DEFAULT (see flags)
 - Seed default: 42 (used when sampling for reproducibility)
-
-Simple generate:
-
-```bash
-curl -s http://localhost:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "inputs": "Write a haiku about GPUs",
-    "parameters": {"max_new_tokens": 64}
-  }' | jq
-```
-
-Apply chat template:
-
-```bash
-curl -s http://localhost:8000/v1/apply_template \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "user", "content": "hello"}
-    ]
-  }' | jq
-```
 
 List models (protected when API_KEY is set):
 
