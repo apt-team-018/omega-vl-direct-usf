@@ -1345,6 +1345,7 @@ async def stream_response(
     completion_tokens = 0
     full_text = ""
     generation_error = None
+    finish_reason = None  # Track finish reason during streaming
     
     try:
         # Send initial chunk with role
@@ -1409,10 +1410,10 @@ async def stream_response(
                 break
             
             try:
-                # Get next token with timeout (30 seconds per token)
+                # Get next token with timeout (0.5 seconds per token for instant stop detection)
                 token_text = await asyncio.wait_for(
                     loop.run_in_executor(None, next, streamer_iter),
-                    timeout=30.0
+                    timeout=0.5
                 )
                 
                 if not token_text:
@@ -1436,6 +1437,11 @@ async def stream_response(
                     ],
                 }
                 yield f"data: {json.dumps(chunk_data)}\n\n"
+                
+                # Check if we've reached max_new_tokens limit
+                if completion_tokens >= max_new_tokens:
+                    finish_reason = "length"
+                    break
                 
                 # Yield control to event loop to ensure immediate sending
                 await asyncio.sleep(0)
@@ -1467,13 +1473,15 @@ async def stream_response(
                 generation_thread.join(timeout=1.0)
             
             # Determine finish reason based on completion status
-            finish_reason = "stop"  # Default: normal EOS token completion
-            
-            if generation_error:
-                finish_reason = "error"
-            elif completion_tokens >= max_new_tokens:
-                # Hit the maximum token limit
-                finish_reason = "length"
+            # Only set if not already set during streaming
+            if finish_reason is None:
+                finish_reason = "stop"  # Default: normal EOS token completion
+                
+                if generation_error:
+                    finish_reason = "error"
+                elif completion_tokens >= max_new_tokens:
+                    # Hit the maximum token limit
+                    finish_reason = "length"
             
             # Send final chunk with finish reason and usage
             final_chunk = {
