@@ -78,7 +78,7 @@ SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG", "GIF", "WEBP"}
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "2"))  # Lower for VLM
 BATCH_TIMEOUT_MS = int(os.getenv("BATCH_TIMEOUT_MS", "10"))  # Allow time for image loading
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", os.getenv("MAX_CONTEXT_TOKENS", "8192")))  # hard clamp
-MAX_NEW_TOKENS_DEFAULT = int(os.getenv("MAX_NEW_TOKENS_DEFAULT", "512"))  # Higher for VLM
+MAX_NEW_TOKENS_DEFAULT = int(os.getenv("MAX_NEW_TOKENS_DEFAULT", "8192"))  # Default to max model length
 # Backpressure: cap queued requests per worker before 503
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "128"))  # Lower for VLM
 API_KEY = os.getenv("API_KEY", "EMPTY")
@@ -777,7 +777,7 @@ class GPUWorker:
         # Extract generation parameters (use max across batch for conservative approach)
         max_new_tokens = min(
             max([int(p.get("max_new_tokens", MAX_NEW_TOKENS_DEFAULT)) for p in params_list]),
-            MAX_NEW_TOKENS_DEFAULT,
+            MAX_MODEL_LENGTH,  # Cap at model's maximum length
         )
         
         min_new_tokens = max([int(p.get("min_new_tokens", 1)) for p in params_list])
@@ -943,7 +943,7 @@ class GPUWorker:
         params = req.params
 
         # Extract generation parameters
-        max_new_tokens = min(int(params.get("max_new_tokens", MAX_NEW_TOKENS_DEFAULT)), MAX_NEW_TOKENS_DEFAULT)
+        max_new_tokens = min(int(params.get("max_new_tokens", MAX_NEW_TOKENS_DEFAULT)), MAX_MODEL_LENGTH)  # Cap at model's maximum length
         min_new_tokens = int(params.get("min_new_tokens", 1))
         do_sample = bool(params.get("do_sample", DO_SAMPLE_DEFAULT))
         
@@ -1520,7 +1520,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     # Build generation parameters
     max_new_tokens = req.max_tokens if req.max_tokens is not None else MAX_NEW_TOKENS_DEFAULT
-    max_new_tokens = min(int(max_new_tokens), MAX_NEW_TOKENS_DEFAULT)
+    max_new_tokens = min(int(max_new_tokens), MAX_MODEL_LENGTH)  # Cap at model's maximum length
     
     min_new_tokens = req.min_tokens if req.min_tokens is not None else 1
     
