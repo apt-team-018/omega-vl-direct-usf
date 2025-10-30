@@ -1049,13 +1049,21 @@ class GPUWorker:
             gen_kwargs["stopping_criteria"] = stopping_criteria
 
         # Start generation in a separate thread
+        generation_error = None
         def generate_fn():
+            nonlocal generation_error
             with torch.inference_mode():
                 try:
                     self.model.generate(**gen_kwargs)
                 except Exception as e:
-                    # Error will be caught by streamer iteration
-                    pass
+                    generation_error = str(e)
+                    if DEBUG_MODE:
+                        logging.exception("Streaming generation failed")
+                    # Signal end to streamer
+                    try:
+                        streamer.end()
+                    except:
+                        pass
 
         generation_thread = Thread(target=generate_fn)
         generation_thread.start()
@@ -1333,11 +1341,11 @@ async def stream_response(
     generation are communicated via error chunks in the SSE stream.
     """
     
+    completion_tokens = 0
+    full_text = ""
+    generation_error = None
+    
     try:
-        completion_tokens = 0
-        full_text = ""
-        generation_error = None
-        
         # Send initial chunk with role
         chunk_data = {
             "id": request_id,
@@ -1354,17 +1362,57 @@ async def stream_response(
         }
         yield f"data: {json.dumps(chunk_data)}\n\n"
         
-        # Stream tokens asynchronously to prevent buffering
-        # NOTE: Stop strings are now handled at engine level via StoppingCriteria
-        # No need to check/truncate here - generation stops automatically
-        
+        # Stream tokens asynchronously with timeout protection
         loop = asyncio.get_event_loop()
         streamer_iter = iter(streamer)
         
+        # Total timeout for entire generation (5 minutes)
+        generation_start = time.time()
+        max_generation_time = 300.0  # 5 minutes total
+        
         while True:
+            # Check if generation thread is still alive
+            if not generation_thread.is_alive():
+                # Thread finished - check for any remaining tokens
+                try:
+                    # Try to get last token with very short timeout
+                    token_text = await asyncio.wait_for(
+                        loop.run_in_executor(None, next, streamer_iter),
+                        timeout=0.1
+                    )
+                    if token_text:
+                        full_text += token_text
+                        completion_tokens += 1
+                        chunk_data = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": token_text},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk_data)}\n\n"
+                except (StopIteration, asyncio.TimeoutError):
+                    pass
+                # Generation thread finished, exit loop
+                break
+            
+            # Check total generation timeout
+            if time.time() - generation_start > max_generation_time:
+                generation_error = "Generation timeout - exceeded 5 minutes"
+                break
+            
             try:
-                # Get next token without blocking the event loop
-                token_text = await loop.run_in_executor(None, next, streamer_iter)
+                # Get next token with timeout (30 seconds per token)
+                token_text = await asyncio.wait_for(
+                    loop.run_in_executor(None, next, streamer_iter),
+                    timeout=30.0
+                )
                 
                 if not token_text:
                     continue
@@ -1392,74 +1440,74 @@ async def stream_response(
                 await asyncio.sleep(0)
                 
             except StopIteration:
-                # No more tokens from generator
+                # No more tokens from generator - normal completion
+                break
+            except asyncio.TimeoutError:
+                # Token timeout - check if thread is still alive
+                if not generation_thread.is_alive():
+                    # Thread finished but no more tokens
+                    break
+                # Thread still alive but no token - this might indicate a hang
+                # Wait a bit more but set error flag
+                generation_error = "Token generation timeout"
                 break
         
-        # Wait for generation thread to complete and check for errors
-        generation_thread.join(timeout=2.0)
-        
-        # Check if thread is still alive (generation timeout)
-        if generation_thread.is_alive():
-            generation_error = "Generation timeout"
-        
-        # Send final chunk with finish reason and usage
-        finish_reason = "error" if generation_error else "stop"
-        final_chunk = {
-            "id": request_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": finish_reason,
-                }
-            ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            }
-        }
-        
-        # Add error details if present
-        if generation_error:
-            final_chunk["error"] = {
-                "message": generation_error,
-                "type": "generation_error",
-                "code": "generation_failed"
-            }
-        
-        yield f"data: {json.dumps(final_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
-        
     except Exception as e:
-        # Exception during streaming - send error chunk
-        # NOTE: HTTP status is already 200 at this point
+        # Exception during streaming - log and set error
         if DEBUG_MODE:
             logging.exception("Streaming error")
-        
-        error_chunk = {
-            "id": request_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "error",
+        generation_error = str(e)
+    
+    finally:
+        # ALWAYS send final chunk with finish reason and usage - this is critical!
+        try:
+            # Wait briefly for generation thread to complete
+            if generation_thread.is_alive():
+                generation_thread.join(timeout=1.0)
+            
+            # Determine finish reason
+            finish_reason = "stop"
+            if generation_error:
+                finish_reason = "error"
+            
+            # Send final chunk with finish reason and usage
+            final_chunk = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
                 }
-            ],
-            "error": {
-                "message": str(e),
-                "type": "stream_error",
-                "code": "internal_error"
             }
-        }
-        yield f"data: {json.dumps(error_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+            
+            # Add error details if present
+            if generation_error:
+                final_chunk["error"] = {
+                    "message": generation_error,
+                    "type": "generation_error",
+                    "code": "generation_failed"
+                }
+            
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as final_error:
+            # Last resort - send minimal done signal
+            if DEBUG_MODE:
+                logging.exception("Error sending final chunk")
+            try:
+                yield "data: [DONE]\n\n"
+            except:
+                pass
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_api_key)])
