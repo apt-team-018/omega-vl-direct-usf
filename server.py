@@ -74,13 +74,25 @@ ALLOW_REMOTE_IMAGES = os.getenv("ALLOW_REMOTE_IMAGES", "1").lower() in {"1", "tr
 # Supported image formats (common formats only)
 SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG", "GIF", "WEBP"}
 
-# Micro-batching knobs (VLM-optimized defaults)
-MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "2"))  # Lower for VLM
+# Micro-batching knobs (H200 + 35B MoE VLM optimized defaults)
+# Configuration optimized for H200 GPU (141GB VRAM) with 35B MoE model:
+# - Model: ~70GB (4B active params, memory-efficient MoE)
+# - Per-request budget: ~17GB (141GB - 70GB model / 4 concurrent)
+# - Total capacity per H200 worker: 16 (4 concurrent + 12 queue)
+# - Conservative for production stability with images + long contexts
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "3"))  # H200 can handle larger batches with MoE
 BATCH_TIMEOUT_MS = int(os.getenv("BATCH_TIMEOUT_MS", "10"))  # Allow time for image loading
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", os.getenv("MAX_CONTEXT_TOKENS", "8192")))  # hard clamp
 MAX_NEW_TOKENS_DEFAULT = int(os.getenv("MAX_NEW_TOKENS_DEFAULT", "8192"))  # Default to max model length
 # Backpressure: cap queued requests per worker before 503
-MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "128"))  # Lower for VLM
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "12"))  # Queue 3x concurrent capacity for burst traffic
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "4"))  # VLM with images needs significant memory per request
+
+# GPU utilization throttling (prevents OOM crashes)
+_max_gpu_util_raw = float(os.getenv("MAX_GPU_UTILIZATION", "0.90"))
+# Clamp to safe range: 0.85 (85%) to 0.95 (95%)
+MAX_GPU_UTILIZATION = max(0.85, min(_max_gpu_util_raw, 0.95))
+
 API_KEY = os.getenv("API_KEY", "EMPTY")
 ATTN_STRICT = os.getenv("ATTN_STRICT", "false").lower() in {"1", "true", "yes", "on"}
 
@@ -697,8 +709,7 @@ class GPUWorker:
                     tokenize=True,
                     add_generation_prompt=True,
                     return_dict=True,
-                    return_tensors="pt",
-                    padding=True
+                    return_tensors="pt"
                 ).to(self.model.device)
                 
                 # Short decode to warm up kernels and cache
@@ -770,246 +781,92 @@ class GPUWorker:
 
     async def _run_batch(self, batch: List[_PendingReq]):
         """Process VLM batch with images and text."""
-        assert self.model is not None and self.processor is not None
-
-        messages_list = [r.messages for r in batch]
-        params_list = [r.params for r in batch]
-
-        # Extract generation parameters (use max across batch for conservative approach)
-        max_new_tokens = min(
-            max([int(p.get("max_new_tokens", MAX_NEW_TOKENS_DEFAULT)) for p in params_list]),
-            MAX_MODEL_LENGTH,  # Cap at model's maximum length
-        )
-        
-        min_new_tokens = max([int(p.get("min_new_tokens", 1)) for p in params_list])
-        
-        do_sample = any(bool(p.get("do_sample", DO_SAMPLE_DEFAULT)) for p in params_list)
-        
-        # Sampling parameters
-        if do_sample:
-            temperature = max([float(p.get("temperature", TEMPERATURE_DEFAULT)) for p in params_list])
-            temperature = max(0.01, min(temperature, 2.0))
-            
-            top_p = max([float(p.get("top_p", TOP_P_DEFAULT)) for p in params_list])
-            top_p = max(0.0, min(top_p, 1.0))
-            
-            top_k = max([int(p.get("top_k", TOP_K_DEFAULT)) for p in params_list])
-            top_k = max(0, top_k)
-            
-            repetition_penalty = max([float(p.get("repetition_penalty", REPETITION_PENALTY_DEFAULT)) for p in params_list])
-            repetition_penalty = max(1.0, min(repetition_penalty, 2.0))
-            
-            length_penalty = params_list[0].get("length_penalty", 1.0)
-            length_penalty = max(-2.0, min(length_penalty, 2.0))
-        else:
-            temperature = 0.0
-            top_p = 1.0
-            top_k = 0
-            repetition_penalty = 1.0
-            length_penalty = 1.0
-
-        # Apply chat template with processor (handles images automatically)
         try:
-            inputs = self.processor.apply_chat_template(
-                messages_list,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-                padding=True
-            ).to(self.model.device)
-        except Exception as e:
-            for req in batch:
-                if not req.future.done():
-                    req.future.set_exception(
-                        HTTPException(status_code=500, detail=f"Failed to process VLM inputs: {e}")
-                    )
-            return
+            assert self.model is not None and self.processor is not None
 
-        # Get input lengths for token counting
-        lengths = inputs["attention_mask"].sum(dim=1) if "attention_mask" in inputs else torch.tensor([inputs["input_ids"].size(1)] * len(batch))
+            messages_list = [r.messages for r in batch]
+            params_list = [r.params for r in batch]
 
-        # Seed for reproducibility
-        batch_seed = int(params_list[0].get("seed", SEED_DEFAULT)) if len(params_list) > 0 else SEED_DEFAULT
-        if do_sample:
+            # Extract generation parameters (use max across batch for conservative approach)
+            max_new_tokens = min(
+                max([int(p.get("max_new_tokens", MAX_NEW_TOKENS_DEFAULT)) for p in params_list]),
+                MAX_MODEL_LENGTH,  # Cap at model's maximum length
+            )
+            
+            min_new_tokens = max([int(p.get("min_new_tokens", 1)) for p in params_list])
+            
+            do_sample = any(bool(p.get("do_sample", DO_SAMPLE_DEFAULT)) for p in params_list)
+            
+            # Sampling parameters
+            if do_sample:
+                temperature = max([float(p.get("temperature", TEMPERATURE_DEFAULT)) for p in params_list])
+                temperature = max(0.01, min(temperature, 2.0))
+                
+                top_p = max([float(p.get("top_p", TOP_P_DEFAULT)) for p in params_list])
+                top_p = max(0.0, min(top_p, 1.0))
+                
+                top_k = max([int(p.get("top_k", TOP_K_DEFAULT)) for p in params_list])
+                top_k = max(0, top_k)
+                
+                repetition_penalty = max([float(p.get("repetition_penalty", REPETITION_PENALTY_DEFAULT)) for p in params_list])
+                repetition_penalty = max(1.0, min(repetition_penalty, 2.0))
+                
+                length_penalty = params_list[0].get("length_penalty", 1.0)
+                length_penalty = max(-2.0, min(length_penalty, 2.0))
+            else:
+                temperature = 0.0
+                top_p = 1.0
+                top_k = 0
+                repetition_penalty = 1.0
+                length_penalty = 1.0
+
+            # Apply chat template with processor (handles images automatically)
             try:
-                torch.manual_seed(batch_seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(batch_seed)
-            except Exception:
-                pass
-
-        # Prepare stopping criteria for stop strings
-        stopping_criteria = None
-        stop_strings_list = []
-        for p in params_list:
-            stops = p.get("stop", [])
-            if isinstance(stops, str):
-                stops = [stops]
-            elif not isinstance(stops, list):
-                stops = []
-            stop_strings_list.extend([s for s in stops if s])
-        
-        # Remove duplicates and create stopping criteria if needed
-        if stop_strings_list:
-            unique_stops = list(set(stop_strings_list))
-            prompt_length = inputs["input_ids"].shape[1]
-            stopping_criteria = StoppingCriteriaList([
-                StopStringCriteria(
-                    self.processor.tokenizer,
-                    unique_stops,
-                    prompt_length
-                )
-            ])
-
-        # Generate with VLM model
-        with torch.inference_mode():
-            try:
-                gen_kwargs = {
-                    **inputs,
-                    "max_new_tokens": max_new_tokens,
-                    "min_new_tokens": min_new_tokens,
-                    "do_sample": do_sample,
-                    "use_cache": True,
-                    "pad_token_id": self.processor.tokenizer.pad_token_id,
-                    "eos_token_id": self.processor.tokenizer.eos_token_id,
-                }
-                
-                if do_sample:
-                    gen_kwargs.update({
-                        "temperature": temperature,
-                        "top_p": top_p,
-                        "top_k": top_k,
-                        "repetition_penalty": repetition_penalty,
-                        "length_penalty": length_penalty,
-                    })
-                
-                # Add stopping criteria if stop strings are present
-                if stopping_criteria:
-                    gen_kwargs["stopping_criteria"] = stopping_criteria
-                
-                outputs = self.model.generate(**gen_kwargs)
+                inputs = self.processor.apply_chat_template(
+                    messages_list,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=True,
+                    return_tensors="pt"
+                ).to(self.model.device)
             except Exception as e:
+                if DEBUG_MODE:
+                    logging.exception(f"[{self.device}] apply_chat_template failed")
                 for req in batch:
                     if not req.future.done():
                         req.future.set_exception(
-                            HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                            HTTPException(status_code=500, detail=f"Failed to process VLM inputs: {e}")
                         )
                 return
 
-        # Decode outputs (trim prompt tokens)
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):]
-            for in_ids, out_ids in zip(inputs.input_ids, outputs)
-        ]
-        
-        decoded_texts = self.processor.batch_decode(
-            generated_ids_trimmed,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False
-        )
+            # Get input lengths for token counting
+            lengths = inputs["attention_mask"].sum(dim=1) if "attention_mask" in inputs else torch.tensor([inputs["input_ids"].size(1)] * len(batch))
 
-        # Set results for each request
-        # NOTE: Stop strings are already handled by StoppingCriteria during generation
-        # No need for post-processing truncation
-        for i, req in enumerate(batch):
-            text = decoded_texts[i]
+            # Seed for reproducibility
+            batch_seed = int(params_list[0].get("seed", SEED_DEFAULT)) if len(params_list) > 0 else SEED_DEFAULT
+            if do_sample:
+                try:
+                    torch.manual_seed(batch_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(batch_seed)
+                except Exception:
+                    pass
 
-            # Token counts
-            prompt_tok_count = int(lengths[i].item()) if i < len(lengths) else 0
-            completion_tok_count = len(generated_ids_trimmed[i])
-
-            if not req.future.done():
-                req.future.set_result({
-                    "text": text,
-                    "prompt_tokens": prompt_tok_count,
-                    "completion_tokens": completion_tok_count,
-                })
-
-
-    async def _run_streaming_batch(self, batch: List[_PendingReq]):
-        """Process VLM batch with streaming support."""
-        assert self.model is not None and self.processor is not None
-
-        # Only support batch size of 1 for streaming
-        if len(batch) != 1:
-            for req in batch:
-                if not req.future.done():
-                    req.future.set_exception(
-                        HTTPException(status_code=400, detail="Streaming only supports batch size of 1")
-                    )
-            return
-
-        req = batch[0]
-        messages_list = [req.messages]
-        params = req.params
-
-        # Extract generation parameters
-        max_new_tokens = min(int(params.get("max_new_tokens", MAX_NEW_TOKENS_DEFAULT)), MAX_MODEL_LENGTH)  # Cap at model's maximum length
-        min_new_tokens = int(params.get("min_new_tokens", 1))
-        do_sample = bool(params.get("do_sample", DO_SAMPLE_DEFAULT))
-        
-        # Sampling parameters
-        if do_sample:
-            temperature = float(params.get("temperature", TEMPERATURE_DEFAULT))
-            temperature = max(0.01, min(temperature, 2.0))
-            top_p = float(params.get("top_p", TOP_P_DEFAULT))
-            top_p = max(0.0, min(top_p, 1.0))
-            top_k = int(params.get("top_k", TOP_K_DEFAULT))
-            top_k = max(0, top_k)
-            repetition_penalty = float(params.get("repetition_penalty", REPETITION_PENALTY_DEFAULT))
-            repetition_penalty = max(1.0, min(repetition_penalty, 2.0))
-            length_penalty = params.get("length_penalty", 1.0)
-            length_penalty = max(-2.0, min(length_penalty, 2.0))
-        else:
-            temperature = 0.0
-            top_p = 1.0
-            top_k = 0
-            repetition_penalty = 1.0
-            length_penalty = 1.0
-
-        # Apply chat template
-        try:
-            inputs = self.processor.apply_chat_template(
-                messages_list,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-                padding=True
-            ).to(self.model.device)
-        except Exception as e:
-            if not req.future.done():
-                req.future.set_exception(
-                    HTTPException(status_code=500, detail=f"Failed to process VLM inputs: {e}")
-                )
-            return
-
-        # Get prompt length for token counting
-        prompt_length = inputs["input_ids"].shape[1]
-        
-        # Seed for reproducibility
-        batch_seed = int(params.get("seed", SEED_DEFAULT))
-        if do_sample:
-            try:
-                torch.manual_seed(batch_seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(batch_seed)
-            except Exception:
-                pass
-
-        # Prepare stopping criteria for stop strings
-        stopping_criteria = None
-        stop_list = params.get("stop", [])
-        if isinstance(stop_list, str):
-            stop_list = [stop_list]
-        elif not isinstance(stop_list, list):
-            stop_list = []
-        
-        # Create stopping criteria if stop strings are present
-        if stop_list:
-            unique_stops = [s for s in stop_list if s]
-            if unique_stops:
+            # Prepare stopping criteria for stop strings
+            stopping_criteria = None
+            stop_strings_list = []
+            for p in params_list:
+                stops = p.get("stop", [])
+                if isinstance(stops, str):
+                    stops = [stops]
+                elif not isinstance(stops, list):
+                    stops = []
+                stop_strings_list.extend([s for s in stops if s])
+            
+            # Remove duplicates and create stopping criteria if needed
+            if stop_strings_list:
+                unique_stops = list(set(stop_strings_list))
+                prompt_length = inputs["input_ids"].shape[1]
                 stopping_criteria = StoppingCriteriaList([
                     StopStringCriteria(
                         self.processor.tokenizer,
@@ -1018,67 +875,268 @@ class GPUWorker:
                     )
                 ])
 
-        # Create streamer
-        streamer = TextIteratorStreamer(
-            self.processor.tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False
-        )
-
-        # Prepare generation kwargs
-        gen_kwargs = {
-            **inputs,
-            "max_new_tokens": max_new_tokens,
-            "min_new_tokens": min_new_tokens,
-            "do_sample": do_sample,
-            "use_cache": True,
-            "pad_token_id": self.processor.tokenizer.pad_token_id,
-            "eos_token_id": self.processor.tokenizer.eos_token_id,
-            "streamer": streamer,
-        }
-        
-        if do_sample:
-            gen_kwargs.update({
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "repetition_penalty": repetition_penalty,
-                "length_penalty": length_penalty,
-            })
-        
-        # Add stopping criteria if stop strings are present
-        if stopping_criteria:
-            gen_kwargs["stopping_criteria"] = stopping_criteria
-
-        # Start generation in a separate thread
-        generation_error = None
-        def generate_fn():
-            nonlocal generation_error
+            # Generate with VLM model
             with torch.inference_mode():
                 try:
-                    self.model.generate(**gen_kwargs)
+                    gen_kwargs = {
+                        **inputs,
+                        "max_new_tokens": max_new_tokens,
+                        "min_new_tokens": min_new_tokens,
+                        "do_sample": do_sample,
+                        "use_cache": True,
+                        "pad_token_id": self.processor.tokenizer.pad_token_id,
+                        "eos_token_id": self.processor.tokenizer.eos_token_id,
+                    }
+                    
+                    if do_sample:
+                        gen_kwargs.update({
+                            "temperature": temperature,
+                            "top_p": top_p,
+                            "top_k": top_k,
+                            "repetition_penalty": repetition_penalty,
+                            "length_penalty": length_penalty,
+                        })
+                    
+                    # Add stopping criteria if stop strings are present
+                    if stopping_criteria:
+                        gen_kwargs["stopping_criteria"] = stopping_criteria
+                    
+                    outputs = self.model.generate(**gen_kwargs)
                 except Exception as e:
+                    if DEBUG_MODE:
+                        logging.exception(f"[{self.device}] model.generate failed")
+                    for req in batch:
+                        if not req.future.done():
+                            req.future.set_exception(
+                                HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                            )
+                    return
+
+            # Decode outputs (trim prompt tokens)
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):]
+                for in_ids, out_ids in zip(inputs.input_ids, outputs)
+            ]
+            
+            decoded_texts = self.processor.batch_decode(
+                generated_ids_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False
+            )
+
+            # Set results for each request
+            # NOTE: Stop strings are already handled by StoppingCriteria during generation
+            # No need for post-processing truncation
+            for i, req in enumerate(batch):
+                text = decoded_texts[i]
+
+                # Token counts
+                prompt_tok_count = int(lengths[i].item()) if i < len(lengths) else 0
+                completion_tok_count = len(generated_ids_trimmed[i])
+
+                if not req.future.done():
+                    req.future.set_result({
+                        "text": text,
+                        "prompt_tokens": prompt_tok_count,
+                        "completion_tokens": completion_tok_count,
+                    })
+        
+        except Exception as e:
+            # Catch-all error handler - ensures server never crashes
+            if DEBUG_MODE:
+                logging.exception(f"[{self.device}] _run_batch critical error")
+            # Set exception on all pending futures
+            for req in batch:
+                if not req.future.done():
+                    req.future.set_exception(
+                        HTTPException(status_code=500, detail=f"Batch processing failed: {e}")
+                    )
+
+
+    async def _run_streaming_batch(self, batch: List[_PendingReq]):
+        """Process VLM batch with streaming support."""
+        try:
+            assert self.model is not None and self.processor is not None
+
+            # Only support batch size of 1 for streaming
+            if len(batch) != 1:
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(
+                            HTTPException(status_code=400, detail="Streaming only supports batch size of 1")
+                        )
+                return
+
+            req = batch[0]
+            messages_list = [req.messages]
+            params = req.params
+
+            # Extract generation parameters
+            max_new_tokens = min(int(params.get("max_new_tokens", MAX_NEW_TOKENS_DEFAULT)), MAX_MODEL_LENGTH)  # Cap at model's maximum length
+            min_new_tokens = int(params.get("min_new_tokens", 1))
+            do_sample = bool(params.get("do_sample", DO_SAMPLE_DEFAULT))
+            
+            # Sampling parameters
+            if do_sample:
+                temperature = float(params.get("temperature", TEMPERATURE_DEFAULT))
+                temperature = max(0.01, min(temperature, 2.0))
+                top_p = float(params.get("top_p", TOP_P_DEFAULT))
+                top_p = max(0.0, min(top_p, 1.0))
+                top_k = int(params.get("top_k", TOP_K_DEFAULT))
+                top_k = max(0, top_k)
+                repetition_penalty = float(params.get("repetition_penalty", REPETITION_PENALTY_DEFAULT))
+                repetition_penalty = max(1.0, min(repetition_penalty, 2.0))
+                length_penalty = params.get("length_penalty", 1.0)
+                length_penalty = max(-2.0, min(length_penalty, 2.0))
+            else:
+                temperature = 0.0
+                top_p = 1.0
+                top_k = 0
+                repetition_penalty = 1.0
+                length_penalty = 1.0
+
+            # Apply chat template
+            try:
+                inputs = self.processor.apply_chat_template(
+                    messages_list,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=True,
+                    return_tensors="pt"
+                ).to(self.model.device)
+            except Exception as e:
+                if DEBUG_MODE:
+                    logging.exception(f"[{self.device}] apply_chat_template failed (streaming)")
+                if not req.future.done():
+                    req.future.set_exception(
+                        HTTPException(status_code=500, detail=f"Failed to process VLM inputs: {e}")
+                    )
+                return
+
+            # Get prompt length for token counting
+            prompt_length = inputs["input_ids"].shape[1]
+            
+            # Seed for reproducibility
+            batch_seed = int(params.get("seed", SEED_DEFAULT))
+            if do_sample:
+                try:
+                    torch.manual_seed(batch_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(batch_seed)
+                except Exception:
+                    pass
+
+            # Prepare stopping criteria for stop strings
+            stopping_criteria = None
+            stop_list = params.get("stop", [])
+            if isinstance(stop_list, str):
+                stop_list = [stop_list]
+            elif not isinstance(stop_list, list):
+                stop_list = []
+            
+            # Create stopping criteria if stop strings are present
+            if stop_list:
+                unique_stops = [s for s in stop_list if s]
+                if unique_stops:
+                    stopping_criteria = StoppingCriteriaList([
+                        StopStringCriteria(
+                            self.processor.tokenizer,
+                            unique_stops,
+                            prompt_length
+                        )
+                    ])
+
+            # Create streamer
+            try:
+                streamer = TextIteratorStreamer(
+                    self.processor.tokenizer,
+                    skip_prompt=True,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False
+                )
+            except Exception as e:
+                if DEBUG_MODE:
+                    logging.exception(f"[{self.device}] Failed to create streamer")
+                if not req.future.done():
+                    req.future.set_exception(
+                        HTTPException(status_code=500, detail=f"Failed to create streamer: {e}")
+                    )
+                return
+
+            # Prepare generation kwargs
+            gen_kwargs = {
+                **inputs,
+                "max_new_tokens": max_new_tokens,
+                "min_new_tokens": min_new_tokens,
+                "do_sample": do_sample,
+                "use_cache": True,
+                "pad_token_id": self.processor.tokenizer.pad_token_id,
+                "eos_token_id": self.processor.tokenizer.eos_token_id,
+                "streamer": streamer,
+            }
+            
+            if do_sample:
+                gen_kwargs.update({
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                    "repetition_penalty": repetition_penalty,
+                    "length_penalty": length_penalty,
+                })
+            
+            # Add stopping criteria if stop strings are present
+            if stopping_criteria:
+                gen_kwargs["stopping_criteria"] = stopping_criteria
+
+            # Start generation in a separate thread
+            generation_error = None
+            def generate_fn():
+                nonlocal generation_error
+                try:
+                    with torch.inference_mode():
+                        try:
+                            self.model.generate(**gen_kwargs)
+                        except Exception as e:
+                            generation_error = str(e)
+                            if DEBUG_MODE:
+                                logging.exception(f"[{self.device}] Streaming generation failed")
+                            # Signal end to streamer
+                            try:
+                                streamer.end()
+                            except:
+                                pass
+                except Exception as e:
+                    # Catch-all for any errors in the thread
                     generation_error = str(e)
                     if DEBUG_MODE:
-                        logging.exception("Streaming generation failed")
-                    # Signal end to streamer
+                        logging.exception(f"[{self.device}] Critical error in generation thread")
                     try:
                         streamer.end()
                     except:
                         pass
 
-        generation_thread = Thread(target=generate_fn)
-        generation_thread.start()
+            generation_thread = Thread(target=generate_fn)
+            generation_thread.start()
 
-        # Set the streamer and metadata as result
-        if not req.future.done():
-            req.future.set_result({
-                "streamer": streamer,
-                "prompt_tokens": prompt_length,
-                "generation_thread": generation_thread,
-                "stop_strings": params.get("stop", []),
-            })
+            # Set the streamer and metadata as result
+            if not req.future.done():
+                req.future.set_result({
+                    "streamer": streamer,
+                    "prompt_tokens": prompt_length,
+                    "generation_thread": generation_thread,
+                    "stop_strings": params.get("stop", []),
+                })
+        
+        except Exception as e:
+            # Catch-all error handler - ensures server never crashes
+            if DEBUG_MODE:
+                logging.exception(f"[{self.device}] _run_streaming_batch critical error")
+            # Set exception on all pending futures
+            for req in batch:
+                if not req.future.done():
+                    req.future.set_exception(
+                        HTTPException(status_code=500, detail=f"Streaming batch processing failed: {e}")
+                    )
 
 
 # -------------------------
@@ -1105,6 +1163,12 @@ def require_api_key(
 class Router:
     def __init__(self, workers: List[GPUWorker]):
         self.workers = workers
+        # Semaphore to limit concurrent requests across all workers
+        self.concurrent_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        self.active_requests = 0  # Track active request count for monitoring
+        # Cache GPU utilization to avoid querying every microsecond
+        self._gpu_util_cache: Dict[int, Tuple[float, float]] = {}  # device_id -> (utilization, timestamp)
+        self._gpu_util_cache_ttl = 0.1  # 100ms cache
 
     async def start(self):
         await asyncio.gather(*(w.start() for w in self.workers))
@@ -1113,23 +1177,126 @@ class Router:
         # Simple least-queue heuristic (effective for bursty loads)
         return min(self.workers, key=lambda w: w.queue.qsize())
 
+    def get_gpu_utilization(self) -> Dict[int, float]:
+        """
+        Get current GPU memory utilization per device.
+        Returns dict of device_id -> utilization (0.0 to 1.0)
+        
+        Uses caching to avoid excessive CUDA queries.
+        Returns 0.0 for CPU fallback or if CUDA unavailable.
+        """
+        if CPU_FALLBACK or not torch.cuda.is_available():
+            return {0: 0.0}
+        
+        current_time = time.time()
+        utilizations = {}
+        
+        for worker in self.workers:
+            device_str = str(worker.device)
+            if not device_str.startswith("cuda:"):
+                utilizations[0] = 0.0
+                continue
+            
+            try:
+                device_id = int(device_str.split(":")[1])
+                
+                # Check cache
+                if device_id in self._gpu_util_cache:
+                    cached_util, cached_time = self._gpu_util_cache[device_id]
+                    if current_time - cached_time < self._gpu_util_cache_ttl:
+                        utilizations[device_id] = cached_util
+                        continue
+                
+                # Query GPU memory
+                allocated = torch.cuda.memory_allocated(device_id)
+                props = torch.cuda.get_device_properties(device_id)
+                total = props.total_memory
+                
+                # Calculate utilization
+                utilization = allocated / total if total > 0 else 0.0
+                
+                # Update cache
+                self._gpu_util_cache[device_id] = (utilization, current_time)
+                utilizations[device_id] = utilization
+                
+            except Exception:
+                # On error, return 0.0 for safety
+                utilizations.get(device_id, 0.0)
+        
+        return utilizations
+
     def is_overloaded(self) -> bool:
-        # Backpressure: if all worker queues are at or above the cap, report overload
+        """
+        Check if server should reject new requests.
+        Returns True if:
+        1. All concurrent slots are taken AND all queues are full
+        2. This prevents accepting requests that cannot be queued
+        """
         try:
-            return all(w.queue.qsize() >= MAX_QUEUE_SIZE for w in self.workers)
+            # Check if we're at concurrent limit
+            at_concurrent_limit = self.concurrent_semaphore.locked()
+            
+            # Check if all worker queues are full
+            all_queues_full = all(w.queue.qsize() >= MAX_QUEUE_SIZE for w in self.workers)
+            
+            # Reject only if both concurrent limit reached AND queues are full
+            return at_concurrent_limit and all_queues_full
         except Exception:
             return False
 
     async def generate_vlm(self, messages: List[Dict[str, Any]], params: Dict[str, Any], is_stream: bool = False):
-        """Generate response for VLM messages."""
+        """
+        Generate response for VLM messages with concurrent request limiting and GPU throttling.
+        
+        Flow:
+        1. Check GPU utilization (reject if over threshold)
+        2. Check if should reject (concurrent limit + queue full)
+        3. Acquire semaphore (blocks if at concurrent limit but queue has space)
+        4. Process request
+        5. Release semaphore in finally block (always happens)
+        """
+        # Check GPU utilization before accepting request
+        gpu_utils = self.get_gpu_utilization()
+        max_util = max(gpu_utils.values()) if gpu_utils else 0.0
+        
+        if max_util > MAX_GPU_UTILIZATION:
+            raise HTTPException(
+                status_code=503,
+                detail=f"GPU utilization at {max_util:.1%}, max allowed {MAX_GPU_UTILIZATION:.1%}. Please retry later."
+            )
+        
+        # Check if we should immediately reject (concurrent limit + all queues full)
         if self.is_overloaded():
-            raise HTTPException(status_code=503, detail="server overloaded: queue full")
-        worker = self._pick_worker()
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future = loop.create_future()
-        req = _PendingReq(messages=messages, params=params, future=fut, is_stream=is_stream)
-        await worker.queue.put(req)
-        return await fut
+            # Get current state for error message
+            concurrent_active = MAX_CONCURRENT_REQUESTS - self.concurrent_semaphore._value
+            total_queued = sum(w.queue.qsize() for w in self.workers)
+            raise HTTPException(
+                status_code=503,
+                detail=f"server overloaded: {concurrent_active} processing, {total_queued} queued (max: {MAX_CONCURRENT_REQUESTS} concurrent, {MAX_QUEUE_SIZE} queue per worker)"
+            )
+        
+        # Acquire semaphore to limit concurrent requests
+        # This will block if at limit but queue has space (request will wait)
+        await self.concurrent_semaphore.acquire()
+        
+        try:
+            # Track active request count
+            self.active_requests += 1
+            
+            # Pick worker and enqueue request
+            worker = self._pick_worker()
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            req = _PendingReq(messages=messages, params=params, future=fut, is_stream=is_stream)
+            await worker.queue.put(req)
+            
+            # Wait for result
+            result = await fut
+            return result
+        finally:
+            # CRITICAL: Always release semaphore, even on errors
+            self.active_requests -= 1
+            self.concurrent_semaphore.release()
 
 
 # -------------------------
@@ -1267,6 +1434,16 @@ async def _startup():
 
 @app.get("/health")
 async def health():
+    """
+    Health check endpoint - called repeatedly by Kubernetes/load balancers/monitoring systems.
+    
+    This is NORMAL and EXPECTED behavior in production environments:
+    - Kubernetes probes this endpoint every few seconds for liveness/readiness checks
+    - Load balancers use it to determine if the instance should receive traffic
+    - Monitoring systems poll it to track service health and availability
+    
+    This is NOT a bug - it's how production infrastructure monitoring works.
+    """
     # Return per-worker queue depth and readiness
     device_names: List[str] = []
     for w in workers:
@@ -1282,6 +1459,41 @@ async def health():
         else:
             device_names.append(d)
     visible_cuda = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    
+    # Calculate load management metrics
+    concurrent_active = MAX_CONCURRENT_REQUESTS - router.concurrent_semaphore._value
+    concurrent_available = router.concurrent_semaphore._value
+    total_queued = sum(w.queue.qsize() for w in workers)
+    total_capacity = MAX_CONCURRENT_REQUESTS + (MAX_QUEUE_SIZE * len(workers))
+    
+    # Get GPU utilization metrics
+    gpu_utils = router.get_gpu_utilization()
+    gpu_memory_info = {}
+    
+    if not CPU_FALLBACK and torch.cuda.is_available():
+        for device_id, utilization in gpu_utils.items():
+            try:
+                allocated = torch.cuda.memory_allocated(device_id)
+                props = torch.cuda.get_device_properties(device_id)
+                total_mem = props.total_memory
+                
+                gpu_memory_info[f"cuda:{device_id}"] = {
+                    "utilization": round(utilization, 4),
+                    "allocated_gb": round(allocated / (1024**3), 2),
+                    "total_gb": round(total_mem / (1024**3), 2),
+                    "allocated_bytes": allocated,
+                    "total_bytes": total_mem,
+                }
+            except Exception:
+                gpu_memory_info[f"cuda:{device_id}"] = {
+                    "utilization": round(utilization, 4),
+                    "error": "Failed to query memory"
+                }
+    
+    # Check if throttling is active
+    max_gpu_util = max(gpu_utils.values()) if gpu_utils else 0.0
+    throttling_active = max_gpu_util > MAX_GPU_UTILIZATION
+    
     return {
         "model_path": (None if REDACT_SOURCE else MODEL_PATH),
         "model_revision": (None if REDACT_SOURCE else MODEL_REVISION),
@@ -1293,7 +1505,23 @@ async def health():
         "startup_ok": STARTUP_OK,
         "startup_error": STARTUP_ERROR,
         "overloaded": router.is_overloaded(),
-        "max_queue_size": MAX_QUEUE_SIZE,
+        "load_management": {
+            "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+            "concurrent_active": concurrent_active,
+            "concurrent_available": concurrent_available,
+            "max_queue_size": MAX_QUEUE_SIZE,
+            "total_queued": total_queued,
+            "total_capacity": total_capacity,
+            "current_load": concurrent_active + total_queued,
+            "load_percentage": round(((concurrent_active + total_queued) / total_capacity) * 100, 1) if total_capacity > 0 else 0,
+        },
+        "gpu_utilization": {
+            "max_threshold": MAX_GPU_UTILIZATION,
+            "current_max": round(max_gpu_util, 4),
+            "throttling_active": throttling_active,
+            "per_device": gpu_memory_info,
+        },
+        "max_queue_size": MAX_QUEUE_SIZE,  # Keep for backwards compatibility
         "dtype": str(DTYPE),
         "attn": ATTN_IMPL,
         "batch": {"max_batch_size": MAX_BATCH_SIZE, "batch_timeout_ms": BATCH_TIMEOUT_MS},
@@ -1351,21 +1579,26 @@ async def stream_response(
     finish_reason = None  # Track finish reason during streaming
     
     try:
-        # Send initial chunk with role
-        chunk_data = {
-            "id": request_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": ""},
-                    "finish_reason": None,
-                }
-            ],
-        }
-        yield f"data: {json.dumps(chunk_data)}\n\n"
+        # Send initial chunk with role - wrap in try/except for safety
+        try:
+            chunk_data = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk_data)}\n\n"
+        except Exception as e:
+            if DEBUG_MODE:
+                logging.exception("Error sending initial chunk")
+            generation_error = f"Failed to send initial chunk: {e}"
         
         # Stream tokens asynchronously with timeout protection
         loop = asyncio.get_event_loop()
@@ -1388,21 +1621,30 @@ async def stream_response(
                     if token_text:
                         full_text += token_text
                         completion_tokens += 1
-                        chunk_data = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": token_text},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk_data)}\n\n"
-                except (StopIteration, asyncio.TimeoutError):
+                        try:
+                            chunk_data = {
+                                "id": request_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model_name,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": token_text},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk_data)}\n\n"
+                        except Exception as chunk_error:
+                            if DEBUG_MODE:
+                                logging.exception("Error sending final token chunk")
+                            generation_error = f"Chunk send error: {chunk_error}"
+                            break
+                except StopIteration:
+                    # StopIteration must be caught and handled - never let it escape into asyncio
+                    break
+                except asyncio.TimeoutError:
                     pass
                 # Generation thread finished, exit loop
                 break
@@ -1425,21 +1667,27 @@ async def stream_response(
                 full_text += token_text
                 completion_tokens += 1
                 
-                # Send token chunk immediately
-                chunk_data = {
-                    "id": request_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": token_text},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk_data)}\n\n"
+                # Send token chunk immediately - wrap in try/except
+                try:
+                    chunk_data = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": token_text},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
+                except Exception as chunk_error:
+                    if DEBUG_MODE:
+                        logging.exception("Error sending token chunk")
+                    generation_error = f"Chunk send error: {chunk_error}"
+                    break
                 
                 # Check if we've reached max_new_tokens limit
                 if completion_tokens >= max_new_tokens:
@@ -1455,7 +1703,8 @@ async def stream_response(
                 await asyncio.sleep(0)
                 
             except StopIteration:
-                # No more tokens from generator - normal completion
+                # StopIteration must be caught and converted to break - never let it escape into asyncio
+                # This is critical: StopIteration interacts badly with generators and futures
                 break
             except asyncio.TimeoutError:
                 # Token timeout - check if thread is still alive
@@ -1465,6 +1714,12 @@ async def stream_response(
                 # Thread still alive but no token - this might indicate a hang
                 # Wait a bit more but set error flag
                 generation_error = "Token generation timeout"
+                break
+            except Exception as token_error:
+                # Catch any other token processing errors
+                if DEBUG_MODE:
+                    logging.exception("Error processing token")
+                generation_error = f"Token processing error: {token_error}"
                 break
         
     except Exception as e:
@@ -1621,6 +1876,9 @@ async def chat_completions(req: ChatCompletionRequest):
         if not all(isinstance(s, str) for s in req.stop):
             raise HTTPException(status_code=400, detail="all stop entries must be strings")
         stop_list = req.stop
+        # Enforce maximum of 3 stop words
+        if len(stop_list) > 3:
+            raise HTTPException(status_code=400, detail="Maximum 3 stop words allowed")
 
     params = {
         "max_new_tokens": max_new_tokens,
@@ -1637,9 +1895,22 @@ async def chat_completions(req: ChatCompletionRequest):
         params["stop"] = stop_list
 
     # Generate with streaming or non-streaming
+    # Wrap in comprehensive error handling to prevent server crashes
     try:
         gen_t0 = time.time()
-        gen_result = await router.generate_vlm(vlm_messages, params, is_stream=req.stream)
+        try:
+            gen_result = await router.generate_vlm(vlm_messages, params, is_stream=req.stream)
+        except HTTPException:
+            # Re-raise HTTP exceptions as-is
+            raise
+        except Exception as gen_error:
+            # Catch ANY generation error and return proper error response
+            if DEBUG_MODE:
+                logging.exception(f"Generation error id={rid}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Generation failed: {str(gen_error)}"
+            )
         
         # Handle streaming response
         if req.stream:
