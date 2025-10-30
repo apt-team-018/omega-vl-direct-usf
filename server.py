@@ -1333,6 +1333,7 @@ async def stream_response(
     prompt_tokens: int,
     request_id: str,
     model_name: str,
+    max_new_tokens: int,
 ) -> AsyncGenerator[str, None]:
     """
     Generate SSE-formatted streaming responses in OpenAI format.
@@ -1465,10 +1466,14 @@ async def stream_response(
             if generation_thread.is_alive():
                 generation_thread.join(timeout=1.0)
             
-            # Determine finish reason
-            finish_reason = "stop"
+            # Determine finish reason based on completion status
+            finish_reason = "stop"  # Default: normal EOS token completion
+            
             if generation_error:
                 finish_reason = "error"
+            elif completion_tokens >= max_new_tokens:
+                # Hit the maximum token limit
+                finish_reason = "length"
             
             # Send final chunk with finish reason and usage
             final_chunk = {
@@ -1626,6 +1631,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     prompt_tokens=gen_result.get("prompt_tokens", 0),
                     request_id=request_id,
                     model_name=MODEL_NAME,
+                    max_new_tokens=max_new_tokens,
                 ),
                 media_type="text/event-stream",
                 headers={
