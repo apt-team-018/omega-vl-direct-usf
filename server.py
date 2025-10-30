@@ -697,7 +697,8 @@ class GPUWorker:
                     tokenize=True,
                     add_generation_prompt=True,
                     return_dict=True,
-                    return_tensors="pt"
+                    return_tensors="pt",
+                    padding=True
                 ).to(self.model.device)
                 
                 # Short decode to warm up kernels and cache
@@ -814,7 +815,8 @@ class GPUWorker:
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=True,
-                return_tensors="pt"
+                return_tensors="pt",
+                padding=True
             ).to(self.model.device)
         except Exception as e:
             for req in batch:
@@ -973,7 +975,8 @@ class GPUWorker:
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=True,
-                return_tensors="pt"
+                return_tensors="pt",
+                padding=True
             ).to(self.model.device)
         except Exception as e:
             if not req.future.done():
@@ -1441,6 +1444,11 @@ async def stream_response(
                 # Check if we've reached max_new_tokens limit
                 if completion_tokens >= max_new_tokens:
                     finish_reason = "length"
+                    if DEBUG_MODE:
+                        logging.debug(
+                            f"[stream] Hit max_new_tokens limit: completion_tokens={completion_tokens} "
+                            f"max_new_tokens={max_new_tokens}"
+                        )
                     break
                 
                 # Yield control to event loop to ensure immediate sending
@@ -1482,6 +1490,13 @@ async def stream_response(
                 elif completion_tokens >= max_new_tokens:
                     # Hit the maximum token limit
                     finish_reason = "length"
+            
+            # Debug logging for finish_reason detection
+            if DEBUG_MODE:
+                logging.debug(
+                    f"[stream] Final finish_reason={finish_reason} completion_tokens={completion_tokens} "
+                    f"max_new_tokens={max_new_tokens} generation_error={generation_error}"
+                )
             
             # Send final chunk with finish reason and usage
             final_chunk = {
@@ -1670,8 +1685,16 @@ async def chat_completions(req: ChatCompletionRequest):
 
     # Finish reason heuristic
     finish_reason = "stop"
-    if req.max_tokens is not None and completion_tokens >= int(req.max_tokens):
+    # Check against actual max_new_tokens used (not just req.max_tokens which may be None)
+    if completion_tokens >= max_new_tokens:
         finish_reason = "length"
+    
+    # Debug logging for finish_reason detection
+    if DEBUG_MODE:
+        logging.debug(
+            f"[req] finish_reason={finish_reason} completion_tokens={completion_tokens} "
+            f"max_new_tokens={max_new_tokens} req.max_tokens={req.max_tokens}"
+        )
 
     resp = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
