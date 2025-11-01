@@ -2091,6 +2091,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 stream_response(
                     streamer=gen_result["streamer"],
                     generation_thread=gen_result["generation_thread"],
+                    stop_strings=gen_result.get("stop_strings", []),
                     prompt_tokens=gen_result.get("prompt_tokens", 0),
                     request_id=request_id,
                     model_name=MODEL_NAME,
