@@ -71,13 +71,14 @@ TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "1").lower() in {"1", "true",
 # Attention kernels: try FlashAttention 2, fallback to SDPA if not available
 ATTN_IMPL = os.getenv("ATTN_IMPL", "flash_attention_2")  # options: "flash_attention_2", "sdpa"
 
-# VLM-specific configuration
-MAX_MODEL_LENGTH = int(os.getenv("MAX_MODEL_LENGTH", "8192"))  # Max sequence length for model
-MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "1024"))  # Max image dimension
+# VLM-specific configuration (PRODUCTION-SAFE DEFAULTS)
+# These values prevent CUDA crashes by ensuring requests stay within model capacity
+MAX_MODEL_LENGTH = int(os.getenv("MAX_MODEL_LENGTH", "6144"))  # Lowered from 8192 for safety margin
+MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "768"))  # Lowered from 1024 to reduce tokens/image
 MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "10"))  # Total images across all messages
-MAX_IMAGES_PER_CONVERSATION = int(os.getenv("MAX_IMAGES_PER_CONVERSATION", "5"))  # Total images across entire conversation history
-IMAGE_TOKEN_BUDGET_PER_IMAGE = int(os.getenv("IMAGE_TOKEN_BUDGET_PER_IMAGE", "2048"))  # Conservative token estimate per image
-SAFETY_MARGIN_TOKENS = int(os.getenv("SAFETY_MARGIN_TOKENS", "512"))  # Buffer tokens for position embeddings
+MAX_IMAGES_PER_CONVERSATION = int(os.getenv("MAX_IMAGES_PER_CONVERSATION", "3"))  # Lowered from 5 for stability
+IMAGE_TOKEN_BUDGET_PER_IMAGE = int(os.getenv("IMAGE_TOKEN_BUDGET_PER_IMAGE", "1500"))  # Reduced for 768px images (was 2048)
+SAFETY_MARGIN_TOKENS = int(os.getenv("SAFETY_MARGIN_TOKENS", "1024"))  # Doubled from 512 for better protection
 IMAGE_CACHE_SIZE = int(os.getenv("IMAGE_CACHE_SIZE", "256"))
 ALLOW_REMOTE_IMAGES = os.getenv("ALLOW_REMOTE_IMAGES", "1").lower() in {"1", "true", "yes"}
 
@@ -93,7 +94,7 @@ SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG", "GIF", "WEBP"}
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "3"))  # H200 can handle larger batches with MoE
 BATCH_TIMEOUT_MS = int(os.getenv("BATCH_TIMEOUT_MS", "10"))  # Allow time for image loading
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", os.getenv("MAX_CONTEXT_TOKENS", "8192")))  # hard clamp
-MAX_NEW_TOKENS_DEFAULT = int(os.getenv("MAX_NEW_TOKENS_DEFAULT", "8192"))  # Default to max model length
+MAX_NEW_TOKENS_DEFAULT = int(os.getenv("MAX_NEW_TOKENS_DEFAULT", "2048"))  # Lowered from 8192 for safety (typical responses)
 # Backpressure: cap queued requests per worker before 503
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "12"))  # Queue 3x concurrent capacity for burst traffic
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "4"))  # VLM with images needs significant memory per request
@@ -628,6 +629,22 @@ def _extract_text_from_content(content: Any) -> str:
     return str(content)
 
 
+def _extract_text_from_messages(messages: List[Dict[str, Any]]) -> str:
+    """Extract all text from VLM messages (ignoring images) for token estimation."""
+    parts: List[str] = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text", "")
+                    if text:
+                        parts.append(text)
+    return " ".join(parts)
+
+
 # -------------------------
 # Request envelope for batching (VLM-enhanced)
 # -------------------------
@@ -652,6 +669,10 @@ class GPUWorker:
         self.model: Optional[Omega17VLExpForConditionalGeneration] = None
         self.ready = asyncio.Event()
         self.batch_task: Optional[asyncio.Task] = None
+        # CUDA health tracking (circuit breaker pattern)
+        self.cuda_healthy = True
+        self.consecutive_cuda_errors = 0
+        self.max_cuda_errors_before_circuit_break = 3
 
     async def start(self):
         # Ensure correct CUDA device context
@@ -784,6 +805,26 @@ class GPUWorker:
         self.batch_task = asyncio.create_task(self._batch_loop())
         self.ready.set()
 
+    def check_cuda_health(self) -> bool:
+        """
+        Test if CUDA context is healthy.
+        Returns True if healthy, False if corrupted.
+        """
+        try:
+            if str(self.device).startswith("cuda"):
+                # Simple tensor operation to test CUDA
+                test_tensor = torch.zeros(1, device=self.device)
+                _ = test_tensor + 1
+                del test_tensor
+                return True
+            return True  # CPU fallback is always "healthy"
+        except RuntimeError as e:
+            error_str = str(e).lower()
+            if "device-side assert" in error_str or "cuda error" in error_str:
+                return False
+            # Other errors might be transient, so re-raise
+            raise
+    
     def _warmup(self):
         """Warmup with VLM-style messages (text-only for simplicity)."""
         warmup_messages = [
@@ -876,6 +917,39 @@ class GPUWorker:
         """Process VLM batch with images and text."""
         try:
             assert self.model is not None and self.processor is not None
+            
+            # CRITICAL: Check CUDA health before processing (circuit breaker)
+            if not self.cuda_healthy:
+                error_msg = f"Worker {self.device} CUDA context is corrupted. Server restart required."
+                logging.error(f"[{self.device}] {error_msg}")
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(
+                            HTTPException(status_code=503, detail=error_msg)
+                        )
+                return
+            
+            # Verify CUDA health with quick test
+            try:
+                if not self.check_cuda_health():
+                    self.cuda_healthy = False
+                    error_msg = f"Worker {self.device} failed CUDA health check. Server restart required."
+                    logging.error(f"[{self.device}] {error_msg}")
+                    for req in batch:
+                        if not req.future.done():
+                            req.future.set_exception(
+                                HTTPException(status_code=503, detail=error_msg)
+                            )
+                    return
+            except Exception as health_error:
+                logging.error(f"[{self.device}] CUDA health check failed: {health_error}")
+                self.cuda_healthy = False
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(
+                            HTTPException(status_code=503, detail="Worker CUDA error - restart required")
+                        )
+                return
 
             messages_list = [r.messages for r in batch]
             params_list = [r.params for r in batch]
@@ -891,6 +965,45 @@ class GPUWorker:
             max_new_tokens = min(max_new_tokens, MAX_MODEL_LENGTH // 2)
             
             min_new_tokens = max([int(p.get("min_new_tokens", 1)) for p in params_list])
+            
+            # PRE-VALIDATION: Estimate tokens BEFORE calling apply_chat_template
+            # This prevents CUDA crashes from oversized requests
+            image_metadata = batch[0].image_metadata if batch else {}
+            image_count = image_metadata.get("image_count", 0) if image_metadata else 0
+            estimated_image_tokens = image_count * IMAGE_TOKEN_BUDGET_PER_IMAGE
+            
+            # Quick text tokenization (without images) for rough estimate
+            max_text_tokens = 0
+            for msg_list in messages_list:
+                try:
+                    text_only = _extract_text_from_messages(msg_list)
+                    if text_only:
+                        # Quick encoding without special tokens
+                        text_tokens = len(self.processor.tokenizer.encode(text_only, add_special_tokens=False))
+                        max_text_tokens = max(max_text_tokens, text_tokens)
+                except Exception:
+                    # If tokenization fails, use conservative estimate
+                    max_text_tokens = max(max_text_tokens, len(text_only.split()) * 2)
+            
+            # Conservative pre-validation estimate
+            estimated_total = max_text_tokens + estimated_image_tokens + max_new_tokens + SAFETY_MARGIN_TOKENS
+            
+            if estimated_total > MAX_MODEL_LENGTH:
+                error_msg = (
+                    f"Request likely exceeds model capacity: ~{max_text_tokens} text tokens + "
+                    f"{estimated_image_tokens} image tokens ({image_count} images) + "
+                    f"{max_new_tokens} generation + {SAFETY_MARGIN_TOKENS} margin "
+                    f"≈ {estimated_total} > {MAX_MODEL_LENGTH} limit. "
+                    f"Reduce conversation length, images, or max_tokens."
+                )
+                if DEBUG_MODE:
+                    logging.warning(f"[{self.device}] Pre-validation rejected request: {error_msg}")
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(
+                            HTTPException(status_code=400, detail=error_msg)
+                        )
+                return
             
             do_sample = any(bool(p.get("do_sample", DO_SAMPLE_DEFAULT)) for p in params_list)
             
@@ -926,13 +1039,74 @@ class GPUWorker:
                     return_dict=True,
                     return_tensors="pt"
                 ).to(self.model.device)
-            except Exception as e:
+            except RuntimeError as e:
+                error_str = str(e).lower()
+                # Detect CUDA-related errors
+                is_cuda_error = any(keyword in error_str for keyword in [
+                    "cuda", "device-side assert", "cublas", "cudnn",
+                    "out of memory", "illegal memory access", "gpu"
+                ])
+                
+                if is_cuda_error:
+                    # CUDA error detected - increment counter
+                    self.consecutive_cuda_errors += 1
+                    logging.error(
+                        f"[{self.device}] CUDA error in apply_chat_template "
+                        f"(error {self.consecutive_cuda_errors}/{self.max_cuda_errors_before_circuit_break}): {e}"
+                    )
+                    if self.consecutive_cuda_errors >= self.max_cuda_errors_before_circuit_break:
+                        self.cuda_healthy = False
+                        logging.critical(f"[{self.device}] CUDA circuit breaker TRIGGERED - marking worker unhealthy")
                 if DEBUG_MODE:
                     logging.exception(f"[{self.device}] apply_chat_template failed")
                 for req in batch:
                     if not req.future.done():
                         req.future.set_exception(
                             HTTPException(status_code=500, detail=f"Failed to process VLM inputs: {e}")
+                        )
+                return
+            except (TypeError, ValueError, OSError) as e:
+                # Torch conversion errors after CUDA corruption
+                # When CUDA is corrupted, torch.as_tensor() fails even for CPU operations
+                error_str = str(e).lower()
+                if "torch" in error_str or "tensor" in error_str or "array" in error_str:
+                    logging.error(
+                        f"[{self.device}] Torch conversion error (likely CUDA corruption): {e}"
+                    )
+                    self.consecutive_cuda_errors += 1
+                    if self.consecutive_cuda_errors >= self.max_cuda_errors_before_circuit_break:
+                        self.cuda_healthy = False
+                        logging.critical(
+                            f"[{self.device}] CUDA circuit breaker TRIGGERED - "
+                            "torch operations failing (CUDA corruption detected)"
+                        )
+                
+                if DEBUG_MODE:
+                    logging.exception(f"[{self.device}] Image preprocessing failed")
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(
+                            HTTPException(status_code=500, detail=f"Image preprocessing failed: {e}")
+                        )
+                return
+            except Exception as e:
+                # Catch-all for unexpected errors
+                error_str = str(e).lower()
+                # If worker already unhealthy, assume cascade failure from CUDA corruption
+                if not self.cuda_healthy:
+                    logging.error(
+                        f"[{self.device}] Operation failed due to corrupted CUDA context: {e}"
+                    )
+                    error_msg = "Worker CUDA corrupted - server restart required"
+                else:
+                    error_msg = f"Unexpected error processing VLM inputs: {e}"
+                
+                if DEBUG_MODE:
+                    logging.exception(f"[{self.device}] apply_chat_template failed")
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(
+                            HTTPException(status_code=500, detail=error_msg)
                         )
                 return
 
@@ -1027,6 +1201,30 @@ class GPUWorker:
                         })
                     
                     outputs = self.model.generate(**gen_kwargs)
+                    
+                    # Success - reset CUDA error counter
+                    self.consecutive_cuda_errors = 0
+                    
+                except RuntimeError as e:
+                    error_str = str(e).lower()
+                    if "cuda" in error_str or "device-side assert" in error_str:
+                        # CUDA error detected - increment counter
+                        self.consecutive_cuda_errors += 1
+                        logging.error(
+                            f"[{self.device}] CUDA error in model.generate "
+                            f"(error {self.consecutive_cuda_errors}/{self.max_cuda_errors_before_circuit_break}): {e}"
+                        )
+                        if self.consecutive_cuda_errors >= self.max_cuda_errors_before_circuit_break:
+                            self.cuda_healthy = False
+                            logging.critical(f"[{self.device}] CUDA circuit breaker TRIGGERED - marking worker unhealthy")
+                    if DEBUG_MODE:
+                        logging.exception(f"[{self.device}] model.generate failed")
+                    for req in batch:
+                        if not req.future.done():
+                            req.future.set_exception(
+                                HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                            )
+                    return
                 except Exception as e:
                     if DEBUG_MODE:
                         logging.exception(f"[{self.device}] model.generate failed")
@@ -1082,6 +1280,39 @@ class GPUWorker:
         """Process VLM batch with streaming support."""
         try:
             assert self.model is not None and self.processor is not None
+            
+            # CRITICAL: Check CUDA health before processing (circuit breaker)
+            if not self.cuda_healthy:
+                error_msg = f"Worker {self.device} CUDA context is corrupted. Server restart required."
+                logging.error(f"[{self.device}] {error_msg}")
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(
+                            HTTPException(status_code=503, detail=error_msg)
+                        )
+                return
+            
+            # Verify CUDA health with quick test
+            try:
+                if not self.check_cuda_health():
+                    self.cuda_healthy = False
+                    error_msg = f"Worker {self.device} failed CUDA health check. Server restart required."
+                    logging.error(f"[{self.device}] {error_msg}")
+                    for req in batch:
+                        if not req.future.done():
+                            req.future.set_exception(
+                                HTTPException(status_code=503, detail=error_msg)
+                            )
+                    return
+            except Exception as health_error:
+                logging.error(f"[{self.device}] CUDA health check failed: {health_error}")
+                self.cuda_healthy = False
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(
+                            HTTPException(status_code=503, detail="Worker CUDA error - restart required")
+                        )
+                return
 
             # Only support batch size of 1 for streaming
             if len(batch) != 1:
@@ -1119,6 +1350,40 @@ class GPUWorker:
                 top_k = 0
                 repetition_penalty = 1.0
                 length_penalty = 1.0
+            
+            # PRE-VALIDATION: Estimate tokens BEFORE calling apply_chat_template
+            image_metadata = req.image_metadata if req.image_metadata else {}
+            image_count = image_metadata.get("image_count", 0)
+            estimated_image_tokens = image_count * IMAGE_TOKEN_BUDGET_PER_IMAGE
+            
+            # Quick text tokenization for estimate
+            try:
+                text_only = _extract_text_from_messages(messages_list)
+                if text_only:
+                    text_tokens = len(self.processor.tokenizer.encode(text_only, add_special_tokens=False))
+                else:
+                    text_tokens = 0
+            except Exception:
+                text_tokens = len(text_only.split()) * 2 if text_only else 0
+            
+            # Conservative pre-validation
+            estimated_total = text_tokens + estimated_image_tokens + max_new_tokens + SAFETY_MARGIN_TOKENS
+            
+            if estimated_total > MAX_MODEL_LENGTH:
+                error_msg = (
+                    f"Request likely exceeds model capacity: ~{text_tokens} text tokens + "
+                    f"{estimated_image_tokens} image tokens ({image_count} images) + "
+                    f"{max_new_tokens} generation + {SAFETY_MARGIN_TOKENS} margin "
+                    f"≈ {estimated_total} > {MAX_MODEL_LENGTH} limit. "
+                    f"Reduce conversation length, images, or max_tokens."
+                )
+                if DEBUG_MODE:
+                    logging.warning(f"[{self.device}] Pre-validation rejected streaming request: {error_msg}")
+                if not req.future.done():
+                    req.future.set_exception(
+                        HTTPException(status_code=400, detail=error_msg)
+                    )
+                return
 
             # Apply chat template
             try:
@@ -1129,6 +1394,24 @@ class GPUWorker:
                     return_dict=True,
                     return_tensors="pt"
                 ).to(self.model.device)
+            except RuntimeError as e:
+                error_str = str(e).lower()
+                if "cuda" in error_str or "device-side assert" in error_str:
+                    self.consecutive_cuda_errors += 1
+                    logging.error(
+                        f"[{self.device}] CUDA error in apply_chat_template (streaming) "
+                        f"(error {self.consecutive_cuda_errors}/{self.max_cuda_errors_before_circuit_break}): {e}"
+                    )
+                    if self.consecutive_cuda_errors >= self.max_cuda_errors_before_circuit_break:
+                        self.cuda_healthy = False
+                        logging.critical(f"[{self.device}] CUDA circuit breaker TRIGGERED - marking worker unhealthy")
+                if DEBUG_MODE:
+                    logging.exception(f"[{self.device}] apply_chat_template failed (streaming)")
+                if not req.future.done():
+                    req.future.set_exception(
+                        HTTPException(status_code=500, detail=f"Failed to process VLM inputs: {e}")
+                    )
+                return
             except Exception as e:
                 if DEBUG_MODE:
                     logging.exception(f"[{self.device}] apply_chat_template failed (streaming)")
@@ -1605,19 +1888,37 @@ async def health():
     """
     # Return per-worker queue depth and readiness
     device_names: List[str] = []
+    worker_health_status: List[Dict[str, Any]] = []
+    
     for w in workers:
         d = str(w.device)
+        device_name = d
         if d.startswith("cuda:") and torch.cuda.is_available():
             try:
                 idx = int(d.split(":")[1])
-                device_names.append(torch.cuda.get_device_name(idx))
+                device_name = torch.cuda.get_device_name(idx)
             except Exception:
-                device_names.append("cuda")
+                device_name = "cuda"
         elif d == "cpu":
-            device_names.append("cpu")
-        else:
-            device_names.append(d)
+            device_name = "cpu"
+        
+        device_names.append(device_name)
+        
+        # Collect worker health info
+        worker_health_status.append({
+            "device": d,
+            "device_name": device_name,
+            "cuda_healthy": w.cuda_healthy,
+            "consecutive_cuda_errors": w.consecutive_cuda_errors,
+            "queue_size": w.queue.qsize(),
+            "ready": w.ready.is_set(),
+        })
+    
     visible_cuda = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    
+    # Count healthy workers
+    healthy_workers = [w for w in workers if w.cuda_healthy and w.ready.is_set()]
+    cuda_corrupted_workers = [w for w in workers if not w.cuda_healthy]
     
     # Calculate load management metrics
     concurrent_active = MAX_CONCURRENT_REQUESTS - router.concurrent_semaphore._value
@@ -1653,6 +1954,12 @@ async def health():
     max_gpu_util = max(gpu_utils.values()) if gpu_utils else 0.0
     throttling_active = max_gpu_util > MAX_GPU_UTILIZATION
     
+    # Server is ready only if we have at least one healthy worker
+    server_ready = len(healthy_workers) > 0 and STARTUP_OK
+    
+    # Server is degraded if some workers are corrupted
+    server_degraded = len(cuda_corrupted_workers) > 0
+    
     return {
         "model_path": (None if REDACT_SOURCE else MODEL_PATH),
         "model_revision": (None if REDACT_SOURCE else MODEL_REVISION),
@@ -1660,10 +1967,17 @@ async def health():
         "device_names": device_names,
         "visible_cuda_devices": visible_cuda,
         "queues": [w.queue.qsize() for w in workers],
-        "ready": all(w.ready.is_set() for w in workers),
+        "ready": server_ready,
+        "degraded": server_degraded,
         "startup_ok": STARTUP_OK,
         "startup_error": STARTUP_ERROR,
         "overloaded": router.is_overloaded(),
+        "worker_health": {
+            "total_workers": len(workers),
+            "healthy_workers": len(healthy_workers),
+            "corrupted_workers": len(cuda_corrupted_workers),
+            "workers": worker_health_status,
+        },
         "load_management": {
             "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
             "concurrent_active": concurrent_active,

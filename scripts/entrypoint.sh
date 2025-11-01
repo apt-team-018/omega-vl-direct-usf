@@ -20,14 +20,15 @@ FA2_TOGGLE=""
 # Defaults for generation behavior (server.py reads these envs)
 TEMP_DEFAULT_ENV="${TEMPERATURE_DEFAULT:-0.8}"
 TOP_P_DEFAULT_ENV="${TOP_P_DEFAULT:-0.9}"
-MAX_NEW_TOKENS_DEFAULT_ENV="${MAX_NEW_TOKENS_DEFAULT:-128}"
+MAX_NEW_TOKENS_DEFAULT_ENV="${MAX_NEW_TOKENS_DEFAULT:-2048}"  # Was 128 - more reasonable default
 SEED_DEFAULT_ENV="${SEED_DEFAULT:-42}"
 DO_SAMPLE_DEFAULT_ENV="${DO_SAMPLE_DEFAULT:-1}"  # 1=true, 0=false
-# VLM configuration (new parameters)
-MAX_MODEL_LENGTH_ENV="${MAX_MODEL_LENGTH:-8192}"
-MAX_IMAGES_PER_CONVERSATION_ENV="${MAX_IMAGES_PER_CONVERSATION:-5}"
-IMAGE_TOKEN_BUDGET_ENV="${IMAGE_TOKEN_BUDGET_PER_IMAGE:-2048}"
-SAFETY_MARGIN_TOKENS_ENV="${SAFETY_MARGIN_TOKENS:-512}"
+# VLM configuration (PRODUCTION-SAFE DEFAULTS)
+# Lowered limits prevent CUDA crashes from oversized requests
+MAX_MODEL_LENGTH_ENV="${MAX_MODEL_LENGTH:-6144}"              # Was 8192 - safer with buffer
+MAX_IMAGES_PER_CONVERSATION_ENV="${MAX_IMAGES_PER_CONVERSATION:-3}"  # Was 5 - more stable
+IMAGE_TOKEN_BUDGET_ENV="${IMAGE_TOKEN_BUDGET_PER_IMAGE:-1500}"       # Was 2048 - matches 768px images
+SAFETY_MARGIN_TOKENS_ENV="${SAFETY_MARGIN_TOKENS:-1024}"            # Was 512 - doubled for safety
 MAX_CONCURRENT_REQUESTS_ENV="${MAX_CONCURRENT_REQUESTS:-4}"
 MAX_QUEUE_SIZE_ENV="${MAX_QUEUE_SIZE:-12}"
 MAX_GPU_UTILIZATION_ENV="${MAX_GPU_UTILIZATION:-0.90}"
@@ -244,6 +245,13 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+
+# CUDA debugging flags (ENABLED for production stability)
+# These add ~20-30% overhead but prevent permanent CUDA corruption
+# CUDA_LAUNCH_BLOCKING=1: Makes CUDA operations synchronous for accurate error location
+# TORCH_USE_CUDA_DSA=1: Enables device-side assertions with detailed error messages
+export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
+export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
 # Harmonize HF auth envs (priority: CLI arg > HF_TOKEN env > HUGGING_FACE_HUB_TOKEN env)
 if [[ -n "${HF_TOKEN_ARG}" ]]; then
