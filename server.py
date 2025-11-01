@@ -286,18 +286,107 @@ def validate_image_format(image: Image.Image, source: str = "image"):
         )
 
 
-async def load_image_from_url(url: str) -> Image.Image:
-    """Load image from URL asynchronously and validate format."""
+def validate_image_integrity(image_data: bytes, source: str = "image") -> Image.Image:
+    """
+    Validate that image data is a genuine, uncorrupted image file.
+    
+    Performs multiple checks:
+    1. Can be opened by PIL
+    2. Has valid format
+    3. Has valid dimensions
+    4. Is not corrupted
+    
+    Returns the validated PIL Image object.
+    """
     try:
+        # First, try to open the image
+        image = Image.open(BytesIO(image_data))
+        
+        # Verify the image is not corrupted
+        # This loads the image header and validates it
+        try:
+            image.verify()
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Corrupted or invalid image file from {source}: {str(e)}"
+            )
+        
+        # After verify(), need to reopen the image as verify() closes it
+        image = Image.open(BytesIO(image_data))
+        
+        # Validate format
+        if not image.format:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unable to determine image format from {source}"
+            )
+        
+        validate_image_format(image, source)
+        
+        # Validate dimensions
+        width, height = image.size
+        if width < 1 or height < 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid image dimensions from {source}: {width}x{height}"
+            )
+        
+        if width > 10000 or height > 10000:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Image dimensions too large from {source}: {width}x{height} (max: 10000x10000)"
+            )
+        
+        # Try to load the image data to ensure it's valid
+        try:
+            image.load()
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to load image data from {source}: {str(e)}"
+            )
+        
+        return image
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid image file from {source}: {str(e)}"
+        )
+
+
+async def load_image_from_url(url: str) -> Image.Image:
+    """Load image from URL asynchronously with comprehensive validation."""
+    try:
+        # Limit response size to prevent memory exhaustion (50MB max)
+        max_size = 50 * 1024 * 1024  # 50MB
+        
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as response:
                 response.raise_for_status()
-                data = await response.read()
-                image = Image.open(BytesIO(data))
                 
-                # Validate format before conversion
-                validate_image_format(image, url)
+                # Check content length if available
+                content_length = response.headers.get('Content-Length')
+                if content_length and int(content_length) > max_size:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Image too large: {int(content_length) / (1024*1024):.1f}MB (max: 50MB)"
+                    )
+                
+                # Read with size limit
+                data = await response.read()
+                if len(data) > max_size:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Image too large: {len(data) / (1024*1024):.1f}MB (max: 50MB)"
+                    )
+                
+                # Validate image integrity
+                image = validate_image_integrity(data, url)
                 
                 # Convert to RGB
                 image = image.convert('RGB')
@@ -313,12 +402,14 @@ async def load_image_from_url(url: str) -> Image.Image:
                 return image
     except HTTPException:
         raise
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download image from URL: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load image from URL: {str(e)}")
 
 
 def load_image_from_base64(data: str) -> Image.Image:
-    """Load image from base64 string and validate format."""
+    """Load image from base64 string with comprehensive validation."""
     try:
         # Handle data URLs
         if data.startswith('data:image'):
@@ -326,12 +417,26 @@ def load_image_from_base64(data: str) -> Image.Image:
             if ',' in data:
                 data = data.split(',', 1)[1]
         
-        # Decode base64
-        image_data = base64.b64decode(data)
-        image = Image.open(BytesIO(image_data))
+        # Decode base64 with size limit (50MB max)
+        max_size = 50 * 1024 * 1024  # 50MB
         
-        # Validate format before conversion
-        validate_image_format(image, "base64 image")
+        try:
+            image_data = base64.b64decode(data)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid base64 encoding: {str(e)}"
+            )
+        
+        # Check decoded size
+        if len(image_data) > max_size:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Decoded image too large: {len(image_data) / (1024*1024):.1f}MB (max: 50MB)"
+            )
+        
+        # Validate image integrity
+        image = validate_image_integrity(image_data, "base64 image")
         
         # Convert to RGB
         image = image.convert('RGB')
