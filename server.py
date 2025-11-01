@@ -1014,7 +1014,7 @@ class GPUWorker:
                         "use_cache": True,
                         "pad_token_id": self.processor.tokenizer.pad_token_id,
                         "eos_token_id": self.processor.tokenizer.eos_token_id,
-                        "max_length": min(MAX_MODEL_LENGTH, max_input_length + max_new_tokens + 1),
+                        "max_length": min(MAX_MODEL_LENGTH, actual_input_tokens + max_new_tokens + 1),
                     }
                     
                     if do_sample:
@@ -1228,7 +1228,7 @@ class GPUWorker:
                 "pad_token_id": self.processor.tokenizer.pad_token_id,
                 "eos_token_id": self.processor.tokenizer.eos_token_id,
                 "streamer": streamer,
-                "max_length": min(MAX_MODEL_LENGTH, prompt_length + max_new_tokens + 1),
+                "max_length": min(MAX_MODEL_LENGTH, actual_input_tokens + max_new_tokens + 1),
             }
             
             if do_sample:
@@ -1275,7 +1275,7 @@ class GPUWorker:
             if not req.future.done():
                 req.future.set_result({
                     "streamer": streamer,
-                    "prompt_tokens": prompt_length,
+                    "prompt_tokens": actual_input_tokens,
                     "generation_thread": generation_thread,
                     "stop_strings": params.get("stop", []),
                 })
