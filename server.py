@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, ORJSONResponse, StreamingResponse
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
-from transformers import AutoProcessor, Omega17VLExpForConditionalGeneration, TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList
+from transformers import AutoProcessor, Omega17VLExpForConditionalGeneration, TextIteratorStreamer
 from transformers.utils import logging as tf_logging
 from PIL import Image
 from io import BytesIO
@@ -45,6 +45,13 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # Flash/SDPA kernels benefit from this; recommended by FA2 docs
 os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 
+# CUDA debugging environment variables (for better error messages)
+# Set CUDA_LAUNCH_BLOCKING=1 to make CUDA operations synchronous for easier debugging
+# Set TORCH_USE_CUDA_DSA=1 to enable device-side assertions for better CUDA error messages
+# Note: These slow down performance significantly - only enable when debugging CUDA errors
+# os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")  # Uncomment for debugging
+# os.environ.setdefault("TORCH_USE_CUDA_DSA", "1")    # Uncomment for debugging
+
 # -------------------------
 # Config (env overrides)
 # -------------------------
@@ -68,6 +75,9 @@ ATTN_IMPL = os.getenv("ATTN_IMPL", "flash_attention_2")  # options: "flash_atten
 MAX_MODEL_LENGTH = int(os.getenv("MAX_MODEL_LENGTH", "8192"))  # Max sequence length for model
 MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "1024"))  # Max image dimension
 MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "10"))  # Total images across all messages
+MAX_IMAGES_PER_CONVERSATION = int(os.getenv("MAX_IMAGES_PER_CONVERSATION", "5"))  # Total images across entire conversation history
+IMAGE_TOKEN_BUDGET_PER_IMAGE = int(os.getenv("IMAGE_TOKEN_BUDGET_PER_IMAGE", "2048"))  # Conservative token estimate per image
+SAFETY_MARGIN_TOKENS = int(os.getenv("SAFETY_MARGIN_TOKENS", "512"))  # Buffer tokens for position embeddings
 IMAGE_CACHE_SIZE = int(os.getenv("IMAGE_CACHE_SIZE", "256"))
 ALLOW_REMOTE_IMAGES = os.getenv("ALLOW_REMOTE_IMAGES", "1").lower() in {"1", "true", "yes"}
 
@@ -250,9 +260,8 @@ class ChatCompletionRequest(BaseModel):
     repetition_penalty: Optional[float] = Field(None, ge=1.0, le=2.0)
     length_penalty: Optional[float] = Field(None, ge=-2.0, le=2.0)
     
-    # Stop conditions
-    stop: Optional[Union[str, List[str]]] = None
-    stop_token_ids: Optional[List[int]] = None
+    # Note: Custom stop strings have been removed due to StopIteration asyncio conflicts
+    # Use eos_token_id instead for stopping generation
     
     # Control
     seed: Optional[int] = None
@@ -356,7 +365,7 @@ async def load_image(image_source: str) -> Image.Image:
 # -------------------------
 # Chat template helpers (VLM-enhanced)
 # -------------------------
-async def prepare_vlm_messages(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
+async def prepare_vlm_messages(messages: List[ChatMessage]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Convert OpenAI-style messages to VLM format with loaded images.
     
@@ -365,9 +374,15 @@ async def prepare_vlm_messages(messages: List[ChatMessage]) -> List[Dict[str, An
     
     Image counting is across ALL messages in the conversation (not per-message),
     matching OpenAI format behavior where MAX_IMAGES_PER_REQUEST is a total limit.
+    
+    Returns:
+        Tuple of (vlm_messages, metadata) where metadata contains:
+        - image_count: Total images in conversation
+        - estimated_image_tokens: Conservative token estimate for all images
     """
     vlm_messages = []
-    total_image_count = 0  # Track images across all messages
+    conversation_image_count = 0  # Track ALL images across entire conversation
+    estimated_image_tokens = 0  # Estimate total tokens consumed by images
     
     for msg in messages:
         role = msg.role
@@ -395,11 +410,14 @@ async def prepare_vlm_messages(messages: List[ChatMessage]) -> List[Dict[str, An
                             image_source = part.image_url.get("url")
                         
                         if image_source:
-                            total_image_count += 1
-                            if total_image_count > MAX_IMAGES_PER_REQUEST:
+                            conversation_image_count += 1
+                            estimated_image_tokens += IMAGE_TOKEN_BUDGET_PER_IMAGE
+                            
+                            # Check conversation-level image limit
+                            if conversation_image_count > MAX_IMAGES_PER_CONVERSATION:
                                 raise HTTPException(
                                     status_code=400,
-                                    detail=f"Maximum {MAX_IMAGES_PER_REQUEST} images allowed across all messages in request"
+                                    detail=f"Maximum {MAX_IMAGES_PER_CONVERSATION} images allowed across entire conversation (found {conversation_image_count} images)"
                                 )
                             
                             # Load and validate image
@@ -414,11 +432,14 @@ async def prepare_vlm_messages(messages: List[ChatMessage]) -> List[Dict[str, An
                             image_source = part.image_url.get("url")
                         
                         if image_source:
-                            total_image_count += 1
-                            if total_image_count > MAX_IMAGES_PER_REQUEST:
+                            conversation_image_count += 1
+                            estimated_image_tokens += IMAGE_TOKEN_BUDGET_PER_IMAGE
+                            
+                            # Check conversation-level image limit
+                            if conversation_image_count > MAX_IMAGES_PER_CONVERSATION:
                                 raise HTTPException(
                                     status_code=400,
-                                    detail=f"Maximum {MAX_IMAGES_PER_REQUEST} images allowed across all messages in request"
+                                    detail=f"Maximum {MAX_IMAGES_PER_CONVERSATION} images allowed across entire conversation (found {conversation_image_count} images)"
                                 )
                             
                             # Load and validate image
@@ -436,11 +457,14 @@ async def prepare_vlm_messages(messages: List[ChatMessage]) -> List[Dict[str, An
                         if isinstance(image_url_dict, dict):
                             image_source = image_url_dict.get("url")
                             if image_source:
-                                total_image_count += 1
-                                if total_image_count > MAX_IMAGES_PER_REQUEST:
+                                conversation_image_count += 1
+                                estimated_image_tokens += IMAGE_TOKEN_BUDGET_PER_IMAGE
+                                
+                                # Check conversation-level image limit
+                                if conversation_image_count > MAX_IMAGES_PER_CONVERSATION:
                                     raise HTTPException(
                                         status_code=400,
-                                        detail=f"Maximum {MAX_IMAGES_PER_REQUEST} images allowed across all messages in request"
+                                        detail=f"Maximum {MAX_IMAGES_PER_CONVERSATION} images allowed across entire conversation (found {conversation_image_count} images)"
                                     )
                                 # Load and validate image
                                 image = await load_image(image_source)
@@ -449,11 +473,14 @@ async def prepare_vlm_messages(messages: List[ChatMessage]) -> List[Dict[str, An
                         # Legacy format
                         image_source = part.get("image") or (part.get("image_url", {}).get("url") if isinstance(part.get("image_url"), dict) else None)
                         if image_source:
-                            total_image_count += 1
-                            if total_image_count > MAX_IMAGES_PER_REQUEST:
+                            conversation_image_count += 1
+                            estimated_image_tokens += IMAGE_TOKEN_BUDGET_PER_IMAGE
+                            
+                            # Check conversation-level image limit
+                            if conversation_image_count > MAX_IMAGES_PER_CONVERSATION:
                                 raise HTTPException(
                                     status_code=400,
-                                    detail=f"Maximum {MAX_IMAGES_PER_REQUEST} images allowed across all messages in request"
+                                    detail=f"Maximum {MAX_IMAGES_PER_CONVERSATION} images allowed across entire conversation (found {conversation_image_count} images)"
                                 )
                             # Load and validate image
                             image = await load_image(image_source)
@@ -468,7 +495,13 @@ async def prepare_vlm_messages(messages: List[ChatMessage]) -> List[Dict[str, An
                 "content": content_parts
             })
     
-    return vlm_messages
+    # Return messages with metadata (actual token validation happens after tokenization)
+    image_metadata = {
+        "image_count": conversation_image_count,
+        "estimated_image_tokens": estimated_image_tokens  # For display/logging only
+    }
+    
+    return vlm_messages, image_metadata
 
 
 def _extract_text_from_content(content: Any) -> str:
@@ -489,52 +522,6 @@ def _extract_text_from_content(content: Any) -> str:
         return "".join(parts)
     return str(content)
 
-# -------------------------
-# Custom Stopping Criteria for Stop Strings
-# -------------------------
-class StopStringCriteria(StoppingCriteria):
-    """
-    Custom stopping criteria that stops generation when any stop string is found.
-    
-    This allows efficient stop string handling at the engine level (like vLLM/TGI),
-    rather than post-processing, which wastes GPU compute.
-    """
-    
-    def __init__(self, tokenizer, stop_strings: List[str], prompt_length: int):
-        self.tokenizer = tokenizer
-        self.stop_strings = [s for s in stop_strings if s]  # Filter empty strings
-        self.prompt_length = prompt_length
-        
-    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor, **kwargs) -> bool:
-        """Check if any stop string appears in the generated text."""
-        if not self.stop_strings:
-            return False
-        
-        # Decode only the generated part (skip prompt)
-        generated_ids = input_ids[0][self.prompt_length:]
-        
-        # Skip if nothing generated yet
-        if len(generated_ids) == 0:
-            return False
-        
-        try:
-            # Decode the generated text
-            decoded_text = self.tokenizer.decode(
-                generated_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False
-            )
-            
-            # Check if any stop string appears
-            for stop_str in self.stop_strings:
-                if stop_str in decoded_text:
-                    return True  # Stop generation
-            
-            return False  # Continue generation
-        except Exception:
-            # If decoding fails, continue generation
-            return False
-
 
 # -------------------------
 # Request envelope for batching (VLM-enhanced)
@@ -545,6 +532,7 @@ class _PendingReq:
     params: Dict[str, Any]
     future: asyncio.Future
     is_stream: bool = False
+    image_metadata: Dict[str, int] = None  # Image count and token estimates
 
 
 # -------------------------
@@ -793,6 +781,10 @@ class GPUWorker:
                 MAX_MODEL_LENGTH,  # Cap at model's maximum length
             )
             
+            # Ensure we have a reasonable buffer for max_new_tokens
+            # This prevents position_ids from exceeding max_position_embeddings
+            max_new_tokens = min(max_new_tokens, MAX_MODEL_LENGTH // 2)
+            
             min_new_tokens = max([int(p.get("min_new_tokens", 1)) for p in params_list])
             
             do_sample = any(bool(p.get("do_sample", DO_SAMPLE_DEFAULT)) for p in params_list)
@@ -839,8 +831,61 @@ class GPUWorker:
                         )
                 return
 
-            # Get input lengths for token counting
+            # Get ACTUAL input token count from tokenized inputs (includes text + images)
             lengths = inputs["attention_mask"].sum(dim=1) if "attention_mask" in inputs else torch.tensor([inputs["input_ids"].size(1)] * len(batch))
+            actual_input_tokens = int(lengths.max().item()) if len(lengths) > 0 else 0
+            
+            # Get image count for error messages
+            image_metadata = batch[0].image_metadata if batch else {}
+            image_count = image_metadata.get("image_count", 0) if image_metadata else 0
+            
+            # STRICT VALIDATION: actual_tokens + max_new_tokens + 512 margin <= MAX_MODEL_LENGTH
+            required_total = actual_input_tokens + max_new_tokens + SAFETY_MARGIN_TOKENS
+            
+            if required_total > MAX_MODEL_LENGTH:
+                error_msg = (
+                    f"Request exceeds model capacity: {actual_input_tokens} input tokens (with {image_count} images) "
+                    f"+ {max_new_tokens} requested generation + {SAFETY_MARGIN_TOKENS} safety margin "
+                    f"= {required_total} tokens > {MAX_MODEL_LENGTH} limit. "
+                    f"Reduce conversation length, number of images, or max_tokens."
+                )
+                if DEBUG_MODE:
+                    logging.error(f"[{self.device}] {error_msg}")
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(
+                            HTTPException(status_code=400, detail=error_msg)
+                        )
+                return
+            
+            # Calculate safe max_new_tokens (should already fit, but clamp for safety)
+            available_tokens = MAX_MODEL_LENGTH - actual_input_tokens - SAFETY_MARGIN_TOKENS
+            safe_max_new_tokens = min(max_new_tokens, available_tokens)
+            
+            if safe_max_new_tokens < 1:
+                error_msg = (
+                    f"No room for generation: {actual_input_tokens} input tokens + {SAFETY_MARGIN_TOKENS} margin "
+                    f"= {actual_input_tokens + SAFETY_MARGIN_TOKENS} / {MAX_MODEL_LENGTH}. "
+                    f"Reduce conversation length or number of images."
+                )
+                if DEBUG_MODE:
+                    logging.error(f"[{self.device}] {error_msg}")
+                for req in batch:
+                    if not req.future.done():
+                        req.future.set_exception(
+                            HTTPException(status_code=400, detail=error_msg)
+                        )
+                return
+            
+            # Use the safe value
+            max_new_tokens = safe_max_new_tokens
+            
+            if DEBUG_MODE:
+                logging.debug(
+                    f"[{self.device}] Token validation: input={actual_input_tokens} (with {image_count} images), "
+                    f"generation={max_new_tokens}, safety={SAFETY_MARGIN_TOKENS}, "
+                    f"total={actual_input_tokens + max_new_tokens + SAFETY_MARGIN_TOKENS}, limit={MAX_MODEL_LENGTH}"
+                )
 
             # Seed for reproducibility
             batch_seed = int(params_list[0].get("seed", SEED_DEFAULT)) if len(params_list) > 0 else SEED_DEFAULT
@@ -852,28 +897,6 @@ class GPUWorker:
                 except Exception:
                     pass
 
-            # Prepare stopping criteria for stop strings
-            stopping_criteria = None
-            stop_strings_list = []
-            for p in params_list:
-                stops = p.get("stop", [])
-                if isinstance(stops, str):
-                    stops = [stops]
-                elif not isinstance(stops, list):
-                    stops = []
-                stop_strings_list.extend([s for s in stops if s])
-            
-            # Remove duplicates and create stopping criteria if needed
-            if stop_strings_list:
-                unique_stops = list(set(stop_strings_list))
-                prompt_length = inputs["input_ids"].shape[1]
-                stopping_criteria = StoppingCriteriaList([
-                    StopStringCriteria(
-                        self.processor.tokenizer,
-                        unique_stops,
-                        prompt_length
-                    )
-                ])
 
             # Generate with VLM model
             with torch.inference_mode():
@@ -886,6 +909,7 @@ class GPUWorker:
                         "use_cache": True,
                         "pad_token_id": self.processor.tokenizer.pad_token_id,
                         "eos_token_id": self.processor.tokenizer.eos_token_id,
+                        "max_length": min(MAX_MODEL_LENGTH, max_input_length + max_new_tokens + 1),
                     }
                     
                     if do_sample:
@@ -896,10 +920,6 @@ class GPUWorker:
                             "repetition_penalty": repetition_penalty,
                             "length_penalty": length_penalty,
                         })
-                    
-                    # Add stopping criteria if stop strings are present
-                    if stopping_criteria:
-                        gen_kwargs["stopping_criteria"] = stopping_criteria
                     
                     outputs = self.model.generate(**gen_kwargs)
                 except Exception as e:
@@ -1013,8 +1033,58 @@ class GPUWorker:
                     )
                 return
 
-            # Get prompt length for token counting
-            prompt_length = inputs["input_ids"].shape[1]
+            # Get ACTUAL input token count from tokenized inputs (includes text + images)
+            actual_input_tokens = inputs["input_ids"].shape[1]
+            
+            # Get image count for error messages
+            image_metadata = req.image_metadata if req.image_metadata else {}
+            image_count = image_metadata.get("image_count", 0)
+            
+            # STRICT VALIDATION: actual_tokens + max_new_tokens + 512 margin <= MAX_MODEL_LENGTH
+            required_total = actual_input_tokens + max_new_tokens + SAFETY_MARGIN_TOKENS
+            
+            if required_total > MAX_MODEL_LENGTH:
+                error_msg = (
+                    f"Request exceeds model capacity: {actual_input_tokens} input tokens (with {image_count} images) "
+                    f"+ {max_new_tokens} requested generation + {SAFETY_MARGIN_TOKENS} safety margin "
+                    f"= {required_total} tokens > {MAX_MODEL_LENGTH} limit. "
+                    f"Reduce conversation length, number of images, or max_tokens."
+                )
+                if DEBUG_MODE:
+                    logging.error(f"[{self.device}] {error_msg}")
+                if not req.future.done():
+                    req.future.set_exception(
+                        HTTPException(status_code=400, detail=error_msg)
+                    )
+                return
+            
+            # Calculate safe max_new_tokens (should already fit, but clamp for safety)
+            available_tokens = MAX_MODEL_LENGTH - actual_input_tokens - SAFETY_MARGIN_TOKENS
+            safe_max_new_tokens = min(max_new_tokens, available_tokens)
+            
+            if safe_max_new_tokens < 1:
+                error_msg = (
+                    f"No room for generation: {actual_input_tokens} input tokens + {SAFETY_MARGIN_TOKENS} margin "
+                    f"= {actual_input_tokens + SAFETY_MARGIN_TOKENS} / {MAX_MODEL_LENGTH}. "
+                    f"Reduce conversation length or number of images."
+                )
+                if DEBUG_MODE:
+                    logging.error(f"[{self.device}] {error_msg}")
+                if not req.future.done():
+                    req.future.set_exception(
+                        HTTPException(status_code=400, detail=error_msg)
+                    )
+                return
+            
+            # Use the safe value
+            max_new_tokens = safe_max_new_tokens
+            
+            if DEBUG_MODE:
+                logging.debug(
+                    f"[{self.device}] Streaming validation: input={actual_input_tokens} (with {image_count} images), "
+                    f"generation={max_new_tokens}, safety={SAFETY_MARGIN_TOKENS}, "
+                    f"total={actual_input_tokens + max_new_tokens + SAFETY_MARGIN_TOKENS}, limit={MAX_MODEL_LENGTH}"
+                )
             
             # Seed for reproducibility
             batch_seed = int(params.get("seed", SEED_DEFAULT))
@@ -1025,26 +1095,6 @@ class GPUWorker:
                         torch.cuda.manual_seed_all(batch_seed)
                 except Exception:
                     pass
-
-            # Prepare stopping criteria for stop strings
-            stopping_criteria = None
-            stop_list = params.get("stop", [])
-            if isinstance(stop_list, str):
-                stop_list = [stop_list]
-            elif not isinstance(stop_list, list):
-                stop_list = []
-            
-            # Create stopping criteria if stop strings are present
-            if stop_list:
-                unique_stops = [s for s in stop_list if s]
-                if unique_stops:
-                    stopping_criteria = StoppingCriteriaList([
-                        StopStringCriteria(
-                            self.processor.tokenizer,
-                            unique_stops,
-                            prompt_length
-                        )
-                    ])
 
             # Create streamer
             try:
@@ -1073,6 +1123,7 @@ class GPUWorker:
                 "pad_token_id": self.processor.tokenizer.pad_token_id,
                 "eos_token_id": self.processor.tokenizer.eos_token_id,
                 "streamer": streamer,
+                "max_length": min(MAX_MODEL_LENGTH, prompt_length + max_new_tokens + 1),
             }
             
             if do_sample:
@@ -1084,9 +1135,6 @@ class GPUWorker:
                     "length_penalty": length_penalty,
                 })
             
-            # Add stopping criteria if stop strings are present
-            if stopping_criteria:
-                gen_kwargs["stopping_criteria"] = stopping_criteria
 
             # Start generation in a separate thread
             generation_error = None
@@ -1244,7 +1292,7 @@ class Router:
         except Exception:
             return False
 
-    async def generate_vlm(self, messages: List[Dict[str, Any]], params: Dict[str, Any], is_stream: bool = False):
+    async def generate_vlm(self, messages: List[Dict[str, Any]], params: Dict[str, Any], is_stream: bool = False, image_metadata: Dict[str, int] = None):
         """
         Generate response for VLM messages with concurrent request limiting and GPU throttling.
         
@@ -1254,6 +1302,12 @@ class Router:
         3. Acquire semaphore (blocks if at concurrent limit but queue has space)
         4. Process request
         5. Release semaphore in finally block (always happens)
+        
+        Args:
+            messages: VLM messages with loaded images
+            params: Generation parameters
+            is_stream: Whether to stream the response
+            image_metadata: Dict with 'image_count' and 'estimated_image_tokens'
         """
         # Check GPU utilization before accepting request
         gpu_utils = self.get_gpu_utilization()
@@ -1287,7 +1341,7 @@ class Router:
             worker = self._pick_worker()
             loop = asyncio.get_running_loop()
             fut: asyncio.Future = loop.create_future()
-            req = _PendingReq(messages=messages, params=params, future=fut, is_stream=is_stream)
+            req = _PendingReq(messages=messages, params=params, future=fut, is_stream=is_stream, image_metadata=image_metadata)
             await worker.queue.put(req)
             
             # Wait for result
@@ -1529,6 +1583,9 @@ async def health():
             "max_model_length": MAX_MODEL_LENGTH,
             "max_image_size": MAX_IMAGE_SIZE,
             "max_images_per_request": MAX_IMAGES_PER_REQUEST,
+            "max_images_per_conversation": MAX_IMAGES_PER_CONVERSATION,
+            "image_token_budget_per_image": IMAGE_TOKEN_BUDGET_PER_IMAGE,
+            "safety_margin_tokens": SAFETY_MARGIN_TOKENS,
             "allow_remote_images": ALLOW_REMOTE_IMAGES,
             "supported_image_formats": list(SUPPORTED_IMAGE_FORMATS),
         },
@@ -1614,10 +1671,20 @@ async def stream_response(
                 # Thread finished - check for any remaining tokens
                 try:
                     # Try to get last token with very short timeout
+                    # CRITICAL: Wrap next() to prevent StopIteration from escaping into asyncio
+                    def safe_next_final():
+                        try:
+                            return next(streamer_iter)
+                        except StopIteration:
+                            return None
+                    
                     token_text = await asyncio.wait_for(
-                        loop.run_in_executor(None, next, streamer_iter),
+                        loop.run_in_executor(None, safe_next_final),
                         timeout=0.1
                     )
+                    # None means StopIteration was caught - stream is done
+                    if token_text is None:
+                        break
                     if token_text:
                         full_text += token_text
                         completion_tokens += 1
@@ -1641,9 +1708,6 @@ async def stream_response(
                                 logging.exception("Error sending final token chunk")
                             generation_error = f"Chunk send error: {chunk_error}"
                             break
-                except StopIteration:
-                    # StopIteration must be caught and handled - never let it escape into asyncio
-                    break
                 except asyncio.TimeoutError:
                     pass
                 # Generation thread finished, exit loop
@@ -1656,11 +1720,23 @@ async def stream_response(
             
             try:
                 # Get next token with timeout (0.5 seconds per token for instant stop detection)
+                # CRITICAL: Wrap next() call to prevent StopIteration from escaping into asyncio
+                def safe_next_token():
+                    try:
+                        return next(streamer_iter)
+                    except StopIteration:
+                        # Convert StopIteration to None to signal end
+                        return None
+                
                 token_text = await asyncio.wait_for(
-                    loop.run_in_executor(None, next, streamer_iter),
+                    loop.run_in_executor(None, safe_next_token),
                     timeout=0.5
                 )
                 
+                # None signals end of iteration (StopIteration was caught)
+                if token_text is None:
+                    break
+                    
                 if not token_text:
                     continue
                     
@@ -1702,10 +1778,6 @@ async def stream_response(
                 # Yield control to event loop to ensure immediate sending
                 await asyncio.sleep(0)
                 
-            except StopIteration:
-                # StopIteration must be caught and converted to break - never let it escape into asyncio
-                # This is critical: StopIteration interacts badly with generators and futures
-                break
             except asyncio.TimeoutError:
                 # Token timeout - check if thread is still alive
                 if not generation_thread.is_alive():
@@ -1843,7 +1915,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     # Check 8: Prepare VLM messages - validate and load images (400 for bad data)
     try:
-        vlm_messages = await prepare_vlm_messages(req.messages)
+        vlm_messages, image_metadata = await prepare_vlm_messages(req.messages)
     except HTTPException:
         raise
     except Exception as e:
@@ -1868,17 +1940,10 @@ async def chat_completions(req: ChatCompletionRequest):
     
     seed = req.seed if req.seed is not None else SEED_DEFAULT
 
-    # Stop strings validation
-    stop_list: List[str] = []
-    if isinstance(req.stop, str):
-        raise HTTPException(status_code=400, detail="stop must be an array of strings")
-    elif isinstance(req.stop, list):
-        if not all(isinstance(s, str) for s in req.stop):
-            raise HTTPException(status_code=400, detail="all stop entries must be strings")
-        stop_list = req.stop
-        # Enforce maximum of 3 stop words
-        if len(stop_list) > 3:
-            raise HTTPException(status_code=400, detail="Maximum 3 stop words allowed")
+    # Note: Custom stop strings feature has been removed due to StopIteration asyncio conflicts
+    # Generation will stop naturally at eos_token_id
+    if hasattr(req, 'stop') and req.stop is not None:
+        raise HTTPException(status_code=400, detail="Custom stop strings are not supported. Use max_tokens to limit generation.")
 
     params = {
         "max_new_tokens": max_new_tokens,
@@ -1891,15 +1956,13 @@ async def chat_completions(req: ChatCompletionRequest):
         "length_penalty": length_penalty,
         "seed": seed,
     }
-    if stop_list:
-        params["stop"] = stop_list
 
     # Generate with streaming or non-streaming
     # Wrap in comprehensive error handling to prevent server crashes
     try:
         gen_t0 = time.time()
         try:
-            gen_result = await router.generate_vlm(vlm_messages, params, is_stream=req.stream)
+            gen_result = await router.generate_vlm(vlm_messages, params, is_stream=req.stream, image_metadata=image_metadata)
         except HTTPException:
             # Re-raise HTTP exceptions as-is
             raise
@@ -1921,7 +1984,6 @@ async def chat_completions(req: ChatCompletionRequest):
                 stream_response(
                     streamer=gen_result["streamer"],
                     generation_thread=gen_result["generation_thread"],
-                    stop_strings=gen_result.get("stop_strings", []),
                     prompt_tokens=gen_result.get("prompt_tokens", 0),
                     request_id=request_id,
                     model_name=MODEL_NAME,
