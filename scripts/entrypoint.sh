@@ -23,6 +23,13 @@ TOP_P_DEFAULT_ENV="${TOP_P_DEFAULT:-0.9}"
 MAX_NEW_TOKENS_DEFAULT_ENV="${MAX_NEW_TOKENS_DEFAULT:-128}"
 SEED_DEFAULT_ENV="${SEED_DEFAULT:-42}"
 DO_SAMPLE_DEFAULT_ENV="${DO_SAMPLE_DEFAULT:-1}"  # 1=true, 0=false
+# VLM configuration (new parameters)
+MAX_IMAGES_PER_CONVERSATION_ENV="${MAX_IMAGES_PER_CONVERSATION:-5}"
+IMAGE_TOKEN_BUDGET_ENV="${IMAGE_TOKEN_BUDGET_PER_IMAGE:-2048}"
+SAFETY_MARGIN_TOKENS_ENV="${SAFETY_MARGIN_TOKENS:-512}"
+MAX_CONCURRENT_REQUESTS_ENV="${MAX_CONCURRENT_REQUESTS:-4}"
+MAX_QUEUE_SIZE_ENV="${MAX_QUEUE_SIZE:-12}"
+MAX_GPU_UTILIZATION_ENV="${MAX_GPU_UTILIZATION:-0.90}"
 # Progress / heartbeat logs (1=on, 0=off)
 PROGRESS_LOGS_ENV="${PROGRESS_LOGS:-0}"
 DEBUG_ENV="${DEBUG:-0}"
@@ -54,6 +61,16 @@ Options:
   --default-max-tokens N     Default max_new_tokens (env MAX_NEW_TOKENS_DEFAULT, default: ${MAX_NEW_TOKENS_DEFAULT_ENV})
   --default-seed N           Default sampling seed (env SEED_DEFAULT, default: ${SEED_DEFAULT_ENV})
   --default-sampling BOOL    Default sampling on/off (env DO_SAMPLE_DEFAULT, default: ${DO_SAMPLE_DEFAULT_ENV}) [true|false]
+  
+VLM & Concurrency Options:
+  --max-images-per-conversation N  Max images across entire conversation (env MAX_IMAGES_PER_CONVERSATION, default: ${MAX_IMAGES_PER_CONVERSATION_ENV})
+  --image-token-budget N           Token estimate per image (env IMAGE_TOKEN_BUDGET_PER_IMAGE, default: ${IMAGE_TOKEN_BUDGET_ENV})
+  --safety-margin-tokens N         Token safety margin (env SAFETY_MARGIN_TOKENS, default: ${SAFETY_MARGIN_TOKENS_ENV})
+  --max-concurrent-requests N      Max parallel requests (env MAX_CONCURRENT_REQUESTS, default: ${MAX_CONCURRENT_REQUESTS_ENV})
+  --max-queue-size N               Max queue size per worker (env MAX_QUEUE_SIZE, default: ${MAX_QUEUE_SIZE_ENV})
+  --max-gpu-utilization F          Max GPU memory utilization 0.0-1.0 (env MAX_GPU_UTILIZATION, default: ${MAX_GPU_UTILIZATION_ENV})
+  
+Server Options:
   --progress BOOL            Enable progress/heartbeat logs (env PROGRESS_LOGS, default: ${PROGRESS_LOGS_ENV}) [true|false]
   --debug BOOL               Enable DEBUG mode (env DEBUG, default: ${DEBUG_ENV}) [true|false]
   --redact-source BOOL       Redact model source/logs (env REDACT_SOURCE, default: ${REDACT_SOURCE_ENV}) [true|false]
@@ -150,6 +167,18 @@ while [[ $# -gt 0 ]]; do
       shift 2;;
     --transformers-path)
       TRANSFORMERS_INSTALL_PATH="${2:-}"; shift 2;;
+    --max-images-per-conversation)
+      MAX_IMAGES_PER_CONVERSATION_ENV="${2:-}"; shift 2;;
+    --image-token-budget)
+      IMAGE_TOKEN_BUDGET_ENV="${2:-}"; shift 2;;
+    --safety-margin-tokens)
+      SAFETY_MARGIN_TOKENS_ENV="${2:-}"; shift 2;;
+    --max-concurrent-requests)
+      MAX_CONCURRENT_REQUESTS_ENV="${2:-}"; shift 2;;
+    --max-queue-size)
+      MAX_QUEUE_SIZE_ENV="${2:-}"; shift 2;;
+    --max-gpu-utilization)
+      MAX_GPU_UTILIZATION_ENV="${2:-}"; shift 2;;
     -h|--help)
       usage; exit 0;;
     --)
@@ -198,6 +227,13 @@ export DEBUG="${DEBUG_ENV}"
 export REDACT_SOURCE="${REDACT_SOURCE_ENV}"
 export HF_HUB_CACHE="${CACHE_DIR_ENV}"
 export FAST_USAGE="${FAST_USAGE_ENV}"
+# VLM configuration exports
+export MAX_IMAGES_PER_CONVERSATION="${MAX_IMAGES_PER_CONVERSATION_ENV}"
+export IMAGE_TOKEN_BUDGET_PER_IMAGE="${IMAGE_TOKEN_BUDGET_ENV}"
+export SAFETY_MARGIN_TOKENS="${SAFETY_MARGIN_TOKENS_ENV}"
+export MAX_CONCURRENT_REQUESTS="${MAX_CONCURRENT_REQUESTS_ENV}"
+export MAX_QUEUE_SIZE="${MAX_QUEUE_SIZE_ENV}"
+export MAX_GPU_UTILIZATION="${MAX_GPU_UTILIZATION_ENV}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
@@ -220,6 +256,8 @@ else
   echo "[entrypoint] MODEL_PATH=$MODEL_PATH DTYPE=$DTYPE ATTN_IMPL=$ATTN_IMPL MAX_BATCH_SIZE=$MAX_BATCH_SIZE BATCH_TIMEOUT_MS=$BATCH_TIMEOUT_MS"
 fi
 echo "[entrypoint] Defaults: TEMPERATURE_DEFAULT=$TEMPERATURE_DEFAULT TOP_P_DEFAULT=$TOP_P_DEFAULT MAX_NEW_TOKENS_DEFAULT=$MAX_NEW_TOKENS_DEFAULT SEED_DEFAULT=$SEED_DEFAULT DO_SAMPLE_DEFAULT=$DO_SAMPLE_DEFAULT"
+echo "[entrypoint] VLM Config: MAX_IMAGES_PER_CONVERSATION=$MAX_IMAGES_PER_CONVERSATION IMAGE_TOKEN_BUDGET_PER_IMAGE=$IMAGE_TOKEN_BUDGET_PER_IMAGE SAFETY_MARGIN_TOKENS=$SAFETY_MARGIN_TOKENS"
+echo "[entrypoint] Concurrency: MAX_CONCURRENT_REQUESTS=$MAX_CONCURRENT_REQUESTS MAX_QUEUE_SIZE=$MAX_QUEUE_SIZE MAX_GPU_UTILIZATION=$MAX_GPU_UTILIZATION"
 echo "[entrypoint] PROGRESS_LOGS=$PROGRESS_LOGS"
 echo "[entrypoint] DEBUG=$DEBUG"
 echo "[entrypoint] REDACT_SOURCE=$REDACT_SOURCE"

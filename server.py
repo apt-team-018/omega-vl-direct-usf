@@ -1981,17 +1981,16 @@ async def chat_completions(req: ChatCompletionRequest):
     
     # Check 1: Ensure workers are ready (503 if not)
     if not all(w.ready.is_set() for w in workers):
-        raise HTTPException(status_code=503, detail="model is still loading")
+        raise HTTPException(status_code=503, detail="Service is starting up. Please try again in a moment.")
     
     # Check 2: Ensure startup was successful (503 if failed)
     if not STARTUP_OK:
-        error_msg = f"model failed to load: {STARTUP_ERROR}" if STARTUP_ERROR else "model not ready"
-        raise HTTPException(status_code=503, detail=error_msg)
+        raise HTTPException(status_code=503, detail="Service is temporarily unavailable. Please contact support if this persists.")
     
     # Check 3: Verify processor is ready (503 if not)
     proc = workers[0].processor
     if proc is None:
-        raise HTTPException(status_code=503, detail="processor not ready")
+        raise HTTPException(status_code=503, detail="Service is not ready yet. Please try again shortly.")
 
     # Check 4: Validate message schema (400 for bad requests)
     if not req.messages or not isinstance(req.messages, list):
@@ -1999,22 +1998,25 @@ async def chat_completions(req: ChatCompletionRequest):
     for m in req.messages:
         role = getattr(m, "role", None)
         if role not in {"system", "user", "assistant"}:
-            raise HTTPException(status_code=400, detail=f"invalid role: {role}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid message role: '{role}'. Each message must have a role of 'system', 'user', or 'assistant'. Please check your message format."
+            )
         if getattr(m, "content", None) is None:
-            raise HTTPException(status_code=400, detail="message content must not be null")
+            raise HTTPException(status_code=400, detail="Message cannot be empty. Please provide content.")
 
     # Check 5: Only n=1 supported (400 for bad request)
     if req.n is not None and int(req.n) != 1:
-        raise HTTPException(status_code=400, detail="Only n=1 is supported")
+        raise HTTPException(status_code=400, detail="Multiple responses per request are not supported. Please request a single response.")
 
     # Check 6: Enforce model name contract (400 for bad request)
     req_model = req.model if req.model is not None else MODEL_NAME
     if req_model != MODEL_NAME:
-        raise HTTPException(status_code=400, detail=f"invalid model: expected '{MODEL_NAME}'")
+        raise HTTPException(status_code=400, detail="Invalid model specified. Please check your request.")
 
     # Check 7: Check server overload before processing (503 if overloaded)
     if router.is_overloaded():
-        raise HTTPException(status_code=503, detail="server overloaded: queue full")
+        raise HTTPException(status_code=503, detail="Server is at capacity processing current requests. Please try again later.")
 
     logp(f"[req] chat start id={rid} model={MODEL_NAME} stream={req.stream}")
 
@@ -2048,7 +2050,7 @@ async def chat_completions(req: ChatCompletionRequest):
     # Note: Custom stop strings feature has been removed due to StopIteration asyncio conflicts
     # Generation will stop naturally at eos_token_id
     if hasattr(req, 'stop') and req.stop is not None:
-        raise HTTPException(status_code=400, detail="Custom stop strings are not supported. Use max_tokens to limit generation.")
+        raise HTTPException(status_code=400, detail="Custom stop sequences are not supported. Please use max_tokens to control response length.")
 
     params = {
         "max_new_tokens": max_new_tokens,
